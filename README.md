@@ -12,7 +12,7 @@ Uses [Google Photos Toolkit (GPTK)](https://github.com/xob0t/Google-Photos-Toolk
 
 ## Install
 
-**[⬇ Download latest release](https://github.com/EnriqueVerduzco/google-photos-deduper/archive/refs/tags/v3.0.0.zip)**
+**[⬇ Download latest release](https://github.com/EnriqueVerduzco/google-photos-deduper/releases/latest/download/chrome-mv3-prod.zip)**
 
 1. Unzip to a permanent folder (don't delete it — Chrome needs it to stay there)
 2. Open `chrome://extensions` → enable **Developer mode** (toggle, top-right)
