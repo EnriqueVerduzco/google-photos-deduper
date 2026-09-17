@@ -563,3 +563,80 @@ describe("getAllMediaItems — page timeout", () => {
     restore()
   })
 })
+
+// Only mocked API pages: no Google Photos or external requests.
+describe("getAllMediaItems — incremental streaming", () => {
+  const media = (mediaKey: string, creationTimestamp: number) => ({ mediaKey, dedupKey: mediaKey, thumb: "local", timestamp: creationTimestamp, creationTimestamp })
+  afterEach(() => { delete (window as any).gptkApi; delete (window as any).WIZ_global_data })
+
+  it("streams the first page before requesting the rest, including watermark ties across pages", async () => {
+    let finishSecond!: (page: unknown) => void
+    const second = new Promise((resolve) => { finishSecond = resolve })
+    const api = vi.fn().mockResolvedValueOnce({ items: [media("new", 300), media("tie1", 200)], nextPageId: "second" })
+      .mockReturnValueOnce(second)
+    ;(window as any).gptkApi = { getItemsByUploadedDate: api }
+    const { messages } = collectMessages()
+    sendCommand("getAllMediaItems", "stream-ties", { streamResults: true, sinceTimestamp: 200 })
+    await flush()
+    expect(messages.filter((m: any) => m.action === "gptkMediaPage")).toHaveLength(1)
+    expect(messages.some((m: any) => m.action === "gptkMediaComplete")).toBe(false)
+    finishSecond({ items: [media("tie2", 200), media("old", 100)], nextPageId: "unused" })
+    await flush()
+    const pages = messages.filter((m: any) => m.action === "gptkMediaPage") as any[]
+    expect(pages.flatMap((page) => page.data.map((item: any) => item.mediaKey))).toEqual(["new", "tie1", "tie2"])
+    expect(api).toHaveBeenCalledTimes(2)
+    expect(messages.find((m: any) => m.action === "gptkMediaComplete")).toMatchObject({
+      totalChunks: 2, metrics: { pages: 2, pageItems: [2, 2], itemsReceived: 4, itemsEmitted: 3, reachedCache: true, retries: null }
+    })
+  })
+
+  it("reports request attempts/retries when the toolkit supports observation", async () => {
+    ;(window as any).gptkApi = { getItemsByUploadedDate: vi.fn(async (_: unknown, __: unknown, onAttempt: (n: number) => void) => {
+      onAttempt(1); onAttempt(2)
+      return { items: [media("a", 100)], nextPageId: null }
+    }) }
+    const { messages } = collectMessages()
+    sendCommand("getAllMediaItems", "metrics", { streamResults: true })
+    await flush()
+    const end = messages.find((m: any) => m.action === "gptkMediaComplete") as any
+    expect(end.metrics).toMatchObject({ pages: 1, requestAttempts: 2, retries: 1, pageItems: [1] })
+    expect(end.metrics.pageRequestMs).toHaveLength(1)
+    expect(end.metrics.requestMs).toBeGreaterThanOrEqual(0)
+  })
+
+  it("bounds oversized pages and finishes empty libraries without fake data chunks", async () => {
+    ;(window as any).gptkApi = { getItemsByUploadedDate: vi.fn().mockResolvedValueOnce({ items: Array.from({ length: 10001 }, (_, i) => media(String(i), 100)), nextPageId: null })
+      .mockResolvedValueOnce({ items: [], nextPageId: null }) }
+    const { messages } = collectMessages()
+    sendCommand("getAllMediaItems", "large-stream", { streamResults: true })
+    await flush()
+    const pages = messages.filter((m: any) => m.action === "gptkMediaPage") as any[]
+    expect(pages.map((p) => p.data.length)).toEqual([10000, 1])
+    sendCommand("getAllMediaItems", "empty-stream", { streamResults: true })
+    await flush()
+    expect(messages.find((m: any) => m.action === "gptkMediaComplete" && m.requestId === "empty-stream"))
+      .toMatchObject({ totalChunks: 0 })
+  })
+
+  it("fails a partial stream without emitting a completion marker", async () => {
+    ;(window as any).gptkApi = { getItemsByUploadedDate: vi.fn()
+      .mockResolvedValueOnce({ items: [media("a", 100)], nextPageId: "broken" }).mockResolvedValueOnce(null) }
+    const { messages } = collectMessages()
+    sendCommand("getAllMediaItems", "partial-error", { streamResults: true })
+    await flush()
+    expect(messages.some((m: any) => m.action === "gptkMediaPage")).toBe(true)
+    expect(messages.some((m: any) => m.action === "gptkMediaComplete")).toBe(false)
+    expect(messages.find((m: any) => m.action === "gptkResult")).toMatchObject({ success: false, mediaFetchMetrics: { pages: 1 } })
+  })
+
+  it("rejects a different or unidentified account before fetching with its cache watermark", async () => {
+    ;(window as any).WIZ_global_data = { oPEP7c: "other@example.com" }
+    const api = vi.fn()
+    ;(window as any).gptkApi = { getItemsByUploadedDate: api }
+    const { messages } = collectMessages()
+    sendCommand("getAllMediaItems", "account-mismatch", { streamResults: true, accountEmail: "a@example.com", sinceTimestamp: 200 })
+    await flush()
+    expect(api).not.toHaveBeenCalled()
+    expect(messages.find((m: any) => m.action === "gptkResult")).toMatchObject({ success: false })
+  })
+})

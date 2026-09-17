@@ -124,6 +124,38 @@ describe("ScanLogger", () => {
       const timings = active?.["phaseTimings"] as Record<string, number>
       expect(timings?.fetchThumbnailsMs).toBe(1234)
     })
+
+    it("persists thumbnail download metrics into the finalized scan log", async () => {
+      const logger = new ScanLogger()
+      await logger.start(500)
+      await logger.recordThumbnailDownloads({
+        concurrency: 12,
+        attempts: 105,
+        successes: 98,
+        failures: 2,
+        httpStatusFailures: 4,
+        throttledResponses: 2,
+        timeouts: 1,
+        retries: 5,
+        elapsedMs: 2000,
+        effectivePerSecond: 49,
+      })
+      await logger.finalize("complete")
+
+      const entry = (store["scanLogs"] as unknown[])[0] as Record<string, unknown>
+      expect(entry.thumbnailDownloads).toEqual({
+        concurrency: 12,
+        attempts: 105,
+        successes: 98,
+        failures: 2,
+        httpStatusFailures: 4,
+        throttledResponses: 2,
+        timeouts: 1,
+        retries: 5,
+        elapsedMs: 2000,
+        effectivePerSecond: 49,
+      })
+    })
   })
 
   describe("recoverStale", () => {
@@ -298,4 +330,21 @@ describe("StabilityTracker", () => {
     tracker.update("fetching", 10, 0)
     expect(onStable).not.toHaveBeenCalled()
   })
+})
+
+
+it("includes Step 1 metrics in finished and recovered scan logs", async () => {
+  const logger = new ScanLogger()
+  await logger.start(0, Date.now() - 5000)
+  const metrics = { mode: "incremental" as const, cacheLoadMs: 15, cachedItems: 1000,
+    mergedItems: 1002, totalFetchMs: 200, pages: 2, pageItems: [50, 50],
+    pageRequestMs: [50, 100], requestMs: 150, requestAttempts: 3, retries: 1 }
+  await logger.recordMediaFetch(metrics, 1002)
+  await logger.finalize("complete", { groupsFound: 0 })
+  expect((store.scanLogs as any[])[0]).toMatchObject({ totalItems: 1002, mediaFetch: metrics, phaseTimings: { fetchMediaItemsMs: 200 } })
+  expect((store.scanLogs as any[])[0].totalMs).toBeGreaterThanOrEqual(5000)
+  await logger.start(0)
+  await logger.recordMediaFetch(metrics, 1002)
+  await new ScanLogger().recoverStale()
+  expect((store.scanLogs as any[]).at(-1)).toMatchObject({ status: "killed_by_reload", mediaFetch: metrics })
 })

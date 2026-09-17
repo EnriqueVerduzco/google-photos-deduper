@@ -11,6 +11,7 @@ interface ScanProgressProps {
   itemsProcessed: number
   totalEstimate: number
   message: string
+  countLabel?: string
   onCancel?: () => void
 }
 
@@ -49,6 +50,7 @@ export function ScanProgress({
   itemsProcessed,
   totalEstimate,
   message,
+  countLabel = "items processed",
   onCancel,
 }: ScanProgressProps) {
   const progress =
@@ -108,7 +110,7 @@ export function ScanProgress({
 
       <Box sx={{ display: "flex", justifyContent: "space-between", mb: 2 }}>
         <Typography variant="caption" color="text.secondary">
-          {itemsProcessed.toLocaleString()} items processed
+          {itemsProcessed.toLocaleString()} {countLabel}
           {isDeterminate && ` / ${totalEstimate.toLocaleString()}`}
         </Typography>
         {isDeterminate && (

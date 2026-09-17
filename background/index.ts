@@ -5,6 +5,8 @@ import type {
   GptkResultMessage,
   GptkResultChunkMessage,
   GptkProgressMessage,
+  GptkMediaPageMessage,
+  GptkMediaCompleteMessage,
 } from "../lib/types"
 
 // Service worker for Google Photos Deduper.
@@ -20,6 +22,8 @@ const pendingCommands: Record<
     resolve: (data: unknown) => void
     reject: (error: string) => void
     appTabId: number
+    mediaPages?: Set<number>
+    mediaTotal?: number
   }
 > = {}
 
@@ -146,6 +150,10 @@ chrome.runtime.onMessage.addListener(
         break
       case "gptkResultChunk":
         handleGptkResultChunk(message as GptkResultChunkMessage, sender)
+        break
+      case "gptkMediaPage":
+      case "gptkMediaComplete":
+        handleMediaStream(message)
         break
       case "gptkProgress":
         handleGptkProgress(message as GptkProgressMessage, sender)
@@ -316,6 +324,29 @@ function handleGptkResultChunk(
   }
 
   if (message.chunkIndex >= message.totalChunks - 1) {
+    pending.resolve(undefined)
+    delete pendingCommands[message.requestId]
+  }
+}
+
+/** Keep routing alive until the terminal marker AND every distinct page arrive. */
+function handleMediaStream(message: GptkMediaPageMessage | GptkMediaCompleteMessage): void {
+  const pending = pendingCommands[message.requestId]
+  if (!pending) return
+  pending.mediaPages ??= new Set()
+  if (message.action === "gptkMediaPage") {
+    if (pending.mediaPages.has(message.chunkIndex)) return
+    pending.mediaPages.add(message.chunkIndex)
+  } else {
+    pending.mediaTotal = message.totalChunks
+  }
+  if (pending.appTabId) {
+    chrome.tabs.sendMessage(pending.appTabId, message).catch((error) => {
+      console.error("[GPD] Failed to relay media stream:", error)
+    })
+  }
+  if (pending.mediaTotal !== undefined && pending.mediaPages.size === pending.mediaTotal &&
+      [...pending.mediaPages].every((index) => index >= 0 && index < pending.mediaTotal!)) {
     pending.resolve(undefined)
     delete pendingCommands[message.requestId]
   }

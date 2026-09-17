@@ -49,6 +49,8 @@ describe("bridge — message forwarding", () => {
   it.each([
     "gptkResult",
     "gptkResultChunk",
+    "gptkMediaPage",
+    "gptkMediaComplete",
     "gptkProgress",
     "gptkLog",
   ])("forwards %s to the service worker", (action) => {
@@ -176,3 +178,9 @@ describe("bridge — delivery failures surface as errors", () => {
     ).not.toThrow()
   })
 })
+
+ it.each(["gptkMediaPage", "gptkMediaComplete"])("reports relay failure for %s", (action) => {
+   mockSendMessage.mockImplementationOnce(() => { throw new Error("delivery failed") })
+   postFromPage({ app: APP_ID, action, command: "getAllMediaItems", requestId: "stream-fail" })
+   expect(forwarded()[1]).toMatchObject({ action: "gptkResult", success: false, requestId: "stream-fail" })
+ })

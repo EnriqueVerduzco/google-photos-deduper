@@ -9,6 +9,7 @@ import { describe, it, expect, vi } from "vitest"
 import { render, screen, fireEvent } from "@testing-library/react"
 import { ThemeProvider, createTheme } from "@mui/material/styles"
 import { ScanConfig } from "../../components/ScanConfig"
+import { DEFAULT_SETTINGS } from "../../lib/types"
 import type { ScanSettings } from "../../lib/types"
 
 // ============================================================
@@ -94,5 +95,55 @@ describe("ScanConfig — time window toggle", () => {
   it("does not render the time window control in full-scan mode", () => {
     renderConfig({ scanMode: "full" })
     expect(screen.queryByText(/Time window:/)).not.toBeInTheDocument()
+  })
+})
+
+describe("ScanConfig — thumbnail download concurrency", () => {
+  it("keeps the default concurrency at 10", () => {
+    expect(DEFAULT_SETTINGS.thumbnailConcurrency).toBe(10)
+    renderConfig({ thumbnailConcurrency: undefined })
+    fireEvent.click(screen.getByRole("button", { name: "More options" }))
+    expect(screen.getByRole("button", { name: "10" })).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    )
+  })
+
+  it.each([10, 12, 16] as const)(
+    "offers and emits concurrency %i",
+    (thumbnailConcurrency) => {
+      const { onSettingsChange } = renderConfig({
+        thumbnailConcurrency: thumbnailConcurrency === 10 ? 12 : 10,
+      })
+      fireEvent.click(screen.getByRole("button", { name: "More options" }))
+      fireEvent.click(
+        screen.getByRole("button", { name: String(thumbnailConcurrency) })
+      )
+      expect(onSettingsChange).toHaveBeenCalledWith({ thumbnailConcurrency })
+    }
+  )
+
+  it("does not offer concurrency 8", () => {
+    renderConfig()
+    fireEvent.click(screen.getByRole("button", { name: "More options" }))
+    expect(screen.queryByRole("button", { name: "8" })).not.toBeInTheDocument()
+  })
+})
+
+
+describe("ScanConfig — metadata refresh", () => {
+  it("defaults to recent uploads independently of matching mode", () => {
+    renderConfig({ scanMode: "full" })
+    fireEvent.click(screen.getByRole("button", { name: "More options" }))
+    expect(screen.getByRole("button", { name: "Use Cache" })).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    )
+  })
+  it("offers a full library reconciliation without changing similarity settings", () => {
+    const { onSettingsChange } = renderConfig()
+    fireEvent.click(screen.getByRole("button", { name: "More options" }))
+    fireEvent.click(screen.getByRole("button", { name: "Refresh entire library" }))
+    expect(onSettingsChange).toHaveBeenCalledWith({ mediaRefreshMode: "full" })
   })
 })

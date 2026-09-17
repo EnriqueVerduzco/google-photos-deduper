@@ -22,14 +22,15 @@ function postResult(command, requestId, data) {
   })
 }
 
-function postError(command, requestId, error) {
+function postError(command, requestId, error, mediaFetchMetrics) {
   window.postMessage({
     app: GPD_APP_ID,
     action: "gptkResult",
     command,
     requestId,
     success: false,
-    error: String(error)
+    error: String(error),
+    ...(mediaFetchMetrics ? { mediaFetchMetrics } : {})
   })
 }
 
@@ -98,9 +99,22 @@ async function getAllMediaItems(requestId, args) {
     return
   }
 
-  // sinceTimestamp: stop paginating once we reach items already in the cache
-  const sinceTimestamp =
-    args && args.sinceTimestamp ? args.sinceTimestamp : null
+  const sinceTimestamp = Number.isFinite(args?.sinceTimestamp) && args.sinceTimestamp > 0
+    ? args.sinceTimestamp : null
+  const streaming = args?.streamResults === true
+  const expectedAccount = args?.accountEmail?.trim().toLowerCase()
+  const getAccount = () => (window.WIZ_global_data?.oPEP7c || "").trim().toLowerCase()
+  const assertAccount = () => {
+    if (expectedAccount && getAccount() !== expectedAccount) {
+      throw new Error("The Google Photos account changed. Reconnect before scanning.")
+    }
+  }
+  const startedAt = performance.now()
+  const metrics = {
+    pages: 0, itemsReceived: 0, itemsEmitted: 0,
+    pageItems: [], pageRequestMs: [], requestMs: 0,
+    requestAttempts: null, retries: null, elapsedMs: 0, reachedCache: false
+  }
 
   // Per-page timeout. Google's pagination endpoint occasionally hangs without
   // ever rejecting fetch(), which used to lock the UI on "Fetching media
@@ -124,65 +138,95 @@ async function getAllMediaItems(requestId, args) {
   }
 
   try {
+    assertAccount()
     let nextPageId = null
-    const mediaItems = []
-    let reachedCache = false
-
-    // Accounts after the first are addressed via a /u/{index}/ path prefix;
-    // computed once since it's invariant for the whole scan.
+    const mediaItems = [] // Only populated for older callers without streaming.
+    let chunkIndex = 0
+    const seenPageIds = new Set()
     const accountUrlPrefix =
       window.location.pathname.match(/^\/u\/\d+\//)?.[0] || "/"
 
     do {
-      const page = await withTimeout(
-        gptkApi.getItemsByUploadedDate(nextPageId),
-        PAGE_TIMEOUT_MS,
-        "Fetching page from Google Photos"
-      )
-      if (!page) {
-        console.warn("GPD: Empty page response, stopping pagination")
-        break
+      assertAccount()
+      const pageStart = performance.now()
+      let page
+      try {
+        page = await withTimeout(
+          gptkApi.getItemsByUploadedDate(nextPageId, true, (attempt) => {
+            metrics.requestAttempts = (metrics.requestAttempts ?? 0) + 1
+            metrics.retries = (metrics.retries ?? 0) + (attempt > 1 ? 1 : 0)
+          }),
+          PAGE_TIMEOUT_MS,
+          "Fetching page from Google Photos"
+        )
+      } finally {
+        const elapsed = performance.now() - pageStart
+        metrics.requestMs += elapsed
+        metrics.pageRequestMs.push(elapsed)
       }
-      if (page.items && page.items.length > 0) {
-        for (const item of page.items) {
-          // Items are sorted newest-first — stop when we hit the cached watermark
-          if (
-            sinceTimestamp !== null &&
-            item.creationTimestamp <= sinceTimestamp
-          ) {
-            reachedCache = true
-            break
-          }
-          mediaItems.push({
-            mediaKey: item.mediaKey,
-            dedupKey: item.dedupKey,
-            thumb: item.thumb,
-            timestamp: item.timestamp,
-            creationTimestamp: item.creationTimestamp,
-            resWidth: item.resWidth,
-            resHeight: item.resHeight,
-            duration: item.duration,
-            isOwned: item.isOwned,
-            isOriginalQuality: item.isOriginalQuality ?? null,
-            fileName: item.descriptionShort || null,
-            productUrl: "https://photos.google.com" + accountUrlPrefix + "photo/" + item.mediaKey
+      assertAccount()
+      if (!page || !Array.isArray(page.items)) {
+        throw new Error("Invalid library page; saved library details were not replaced.")
+      }
+      metrics.pages++
+      metrics.itemsReceived += page.items.length
+      metrics.pageItems.push(page.items.length)
+      const pageItems = []
+      for (const item of page.items) {
+        // Read the entire watermark timestamp, even when ties span pages.
+        // Equal-timestamp uploads may be absent from the previous snapshot.
+        if (sinceTimestamp !== null && Number.isFinite(item.creationTimestamp) &&
+            item.creationTimestamp < sinceTimestamp) {
+          metrics.reachedCache = true
+          break
+        }
+        pageItems.push({
+          mediaKey: item.mediaKey,
+          dedupKey: item.dedupKey,
+          thumb: item.thumb,
+          timestamp: item.timestamp,
+          creationTimestamp: item.creationTimestamp,
+          resWidth: item.resWidth,
+          resHeight: item.resHeight,
+          duration: item.duration,
+          isOwned: item.isOwned,
+          isOriginalQuality: item.isOriginalQuality ?? null,
+          fileName: item.descriptionShort || null,
+          productUrl: "https://photos.google.com" + accountUrlPrefix + "photo/" + item.mediaKey
+        })
+      }
+      metrics.itemsEmitted += pageItems.length
+      if (streaming) {
+        // Bound message size, including when an API page itself is very large.
+        for (let i = 0; i < pageItems.length; i += RESULT_CHUNK_SIZE) {
+          window.postMessage({
+            app: GPD_APP_ID, action: "gptkMediaPage", command: "getAllMediaItems",
+            requestId, chunkIndex: chunkIndex++, data: pageItems.slice(i, i + RESULT_CHUNK_SIZE)
           })
         }
+      } else {
+        for (const item of pageItems) mediaItems.push(item)
       }
       nextPageId = page.nextPageId || null
-
-      postProgress(
-        requestId,
-        mediaItems.length,
-        `Fetched ${mediaItems.length} items`
-      )
-
-      if (reachedCache) break
+      postProgress(requestId, metrics.itemsEmitted, `Fetched ${metrics.itemsEmitted} items`)
+      if (metrics.reachedCache) break
+      if (nextPageId && seenPageIds.has(nextPageId)) throw new Error("Library pagination repeated a page token")
+      if (nextPageId) seenPageIds.add(nextPageId)
     } while (nextPageId)
 
-    postResultChunked("getAllMediaItems", requestId, mediaItems)
+    metrics.elapsedMs = performance.now() - startedAt
+    if (streaming) {
+      window.postMessage({
+        app: GPD_APP_ID, action: "gptkMediaComplete", command: "getAllMediaItems",
+        requestId, totalChunks: chunkIndex, accountEmail: getAccount() || undefined,
+        sentAt: Date.now(), metrics
+      })
+    } else {
+      postResultChunked("getAllMediaItems", requestId, mediaItems)
+    }
   } catch (error) {
-    postError("getAllMediaItems", requestId, error)
+    metrics.elapsedMs = performance.now() - startedAt
+    postError("getAllMediaItems", requestId, error, metrics)
   }
 }
 

@@ -91,6 +91,26 @@ export function ScanConfig({
           <AccordionDetails>
             <Box sx={{ mb: 3 }}>
               <Typography variant="body2" fontWeight={500} sx={{ mb: 1 }}>
+                Library refresh
+              </Typography>
+              <ToggleButtonGroup
+                value={settings.mediaRefreshMode ?? "incremental"}
+                exclusive size="small" fullWidth
+                aria-label="Library refresh"
+                onChange={(_, value) => {
+                  if (value !== null) onSettingsChange({ mediaRefreshMode: value })
+                }}>
+                <ToggleButton value="incremental">Use Cache</ToggleButton>
+                <ToggleButton value="full">Refresh entire library</ToggleButton>
+              </ToggleButtonGroup>
+              <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
+                Recent uploads reuses saved library details. Refresh the entire library
+                to include older edits, deletions, and restored items.
+              </Typography>
+            </Box>
+
+            <Box sx={{ mb: 3 }}>
+              <Typography variant="body2" fontWeight={500} sx={{ mb: 1 }}>
                 Scan mode
               </Typography>
               <ToggleButtonGroup
@@ -135,6 +155,34 @@ export function ScanConfig({
                 </Typography>
               </Box>
             )}
+
+            <Box sx={{ mb: 3 }}>
+              <Typography variant="body2" fontWeight={500} sx={{ mb: 1 }}>
+                Concurrent Thumbnail Downloads:
+              </Typography>
+              <ToggleButtonGroup
+                value={settings.thumbnailConcurrency ?? 10}
+                exclusive
+                size="small"
+                fullWidth
+                aria-label="Thumbnail download concurrency"
+                onChange={(_, value) => {
+                  if (value !== null) {
+                    onSettingsChange({ thumbnailConcurrency: value })
+                  }
+                }}>
+                <ToggleButton value={10}>10</ToggleButton>
+                <ToggleButton value={12}>12</ToggleButton>
+                <ToggleButton value={16}>16</ToggleButton>
+              </ToggleButtonGroup>
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                sx={{ display: "block", mt: 0.5 }}>
+                Concurrent requests. Start at 10; higher values may trigger
+                throttling.
+              </Typography>
+            </Box>
 
             <Box>
               <Typography variant="body2" fontWeight={500} sx={{ mb: 1 }}>

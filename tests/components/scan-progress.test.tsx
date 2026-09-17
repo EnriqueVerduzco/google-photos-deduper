@@ -21,6 +21,7 @@ interface Props {
   itemsProcessed?: number
   totalEstimate?: number
   message?: string
+  countLabel?: string
   onCancel?: (() => void) | undefined
 }
 
@@ -30,6 +31,7 @@ function renderScanProgress(props: Props = {}) {
     itemsProcessed: 0,
     totalEstimate: 0,
     message: "",
+    countLabel: "items processed",
     onCancel: undefined,
   }
   const merged = { ...defaults, ...props }
@@ -82,6 +84,15 @@ describe("ScanProgress", () => {
     it("shows processed / total when totalEstimate > 0", () => {
       renderScanProgress({ itemsProcessed: 300, totalEstimate: 1000 })
       expect(screen.getByText("300 items processed / 1,000")).toBeInTheDocument()
+    })
+
+    it("labels Full detection work as checks instead of media items", () => {
+      renderScanProgress({
+        phase: "detecting_duplicates", countLabel: "checks completed",
+        itemsProcessed: 500, totalEstimate: 1000,
+      })
+      expect(screen.getByText("500 checks completed / 1,000")).toBeInTheDocument()
+      expect(screen.getByText("50%")).toBeInTheDocument()
     })
 
     it("formats large numbers with locale separators", () => {

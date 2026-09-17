@@ -65,6 +65,24 @@ describe("topK", () => {
     expect(values[0]).toBeCloseTo(0.42)
     expect(indices).toEqual([0])
   })
+
+  it.each([2, 50, 75, 128])(
+    "matches a full descending sort for k=%i",
+    (k) => {
+      // Unique deterministic values exercise both the heap and quickselect paths.
+      const arr = new Float32Array(
+        Array.from({ length: 128 }, (_, i) => ((i * 73) % 131) / 131)
+      )
+      const expected = Array.from(arr)
+        .map((value, index) => ({ value, index }))
+        .sort((a, b) => b.value - a.value)
+        .slice(0, k)
+      const actual = topK(arr, k)
+
+      expect(actual.values).toEqual(expected.map((x) => x.value))
+      expect(actual.indices).toEqual(expected.map((x) => x.index))
+    }
+  )
 })
 
 // ============================================================

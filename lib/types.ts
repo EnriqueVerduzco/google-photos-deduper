@@ -111,6 +111,7 @@ export interface GptkResultMessage extends BaseMessage {
   success: boolean;
   data?: unknown;
   error?: string;
+  mediaFetchMetrics?: MediaFetchMetrics;
 }
 
 /**
@@ -130,6 +131,39 @@ export interface GptkResultChunkMessage extends BaseMessage {
   chunkIndex: number;
   totalChunks: number;
   data: unknown[];
+}
+
+/** Each API page is sent immediately; its final count is not known yet. */
+export interface GptkMediaPageMessage extends BaseMessage {
+  action: "gptkMediaPage";
+  command: "getAllMediaItems";
+  requestId: string;
+  chunkIndex: number;
+  data: GpdMediaItem[];
+}
+
+export interface MediaFetchMetrics {
+  pages: number;
+  itemsReceived: number;
+  itemsEmitted: number;
+  pageItems: number[];
+  pageRequestMs: number[];
+  requestMs: number;
+  /** Null when an older toolkit cannot report retry attempts. */
+  requestAttempts: number | null;
+  retries: number | null;
+  elapsedMs: number;
+  reachedCache: boolean;
+}
+
+export interface GptkMediaCompleteMessage extends BaseMessage {
+  action: "gptkMediaComplete";
+  command: "getAllMediaItems";
+  requestId: string;
+  totalChunks: number;
+  accountEmail?: string;
+  sentAt: number;
+  metrics: MediaFetchMetrics;
 }
 
 export interface GptkProgressMessage extends BaseMessage {
@@ -164,6 +198,8 @@ export type AppMessage =
   | GptkCommandMessage
   | GptkResultMessage
   | GptkResultChunkMessage
+  | GptkMediaPageMessage
+  | GptkMediaCompleteMessage
   | GptkProgressMessage
   | GptkLogMessage;
 
@@ -216,8 +252,16 @@ export interface StoredState {
 }
 
 export interface ScanSettings {
+  /** Incremental metadata refresh, or a complete reconciliation with the library. */
+  mediaRefreshMode?: "incremental" | "full";
   similarityThreshold: number;
   scanMode: ScanMode;
+  /**
+   * Maximum number of thumbnails downloaded at once. Optional so settings
+   * saved by older extension versions continue to load; callers fall back to
+   * the legacy value of 10.
+   */
+  thumbnailConcurrency?: 10 | 12 | 16;
   /**
    * Smart-mode timestamp bucket window in seconds. Items with `taken` dates
    * within this window are compared against each other. Default is 1 second
@@ -236,4 +280,5 @@ export const DEFAULT_SETTINGS: ScanSettings = {
   similarityThreshold: 0.99,
   scanMode: "smart",
   smartWindowSec: 1,
+  thumbnailConcurrency: 10,
 };

@@ -400,3 +400,24 @@ describe("message filtering", () => {
     expect(mockChrome.tabs.sendMessage).not.toHaveBeenCalled()
   })
 })
+
+
+describe("media stream routing", () => {
+  it("routes completion-before-pages, deduplicates deliveries, and cleans up only when complete", async () => {
+    const requestId = "stream-out-of-order"
+    mockChrome.tabs.query.mockImplementation((query: { url?: string }) => Promise.resolve([{ id: query?.url?.includes("photos.google.com") ? 10 : 20 }]))
+    mockChrome.tabs.sendMessage.mockResolvedValue(undefined)
+    dispatchMessage({ app: APP_ID, action: "gptkCommand", command: "getAllMediaItems", requestId, args: {} }, appSender())
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    mockChrome.tabs.sendMessage.mockClear()
+    const base = { app: APP_ID, command: "getAllMediaItems", requestId }
+    const end = { ...base, action: "gptkMediaComplete", totalChunks: 2 }
+    const page = (chunkIndex: number) => ({ ...base, action: "gptkMediaPage", chunkIndex, data: [] })
+    dispatchMessage(end, gpSender(10))
+    dispatchMessage(page(1), gpSender(10))
+    dispatchMessage(page(1), gpSender(10))
+    dispatchMessage(page(0), gpSender(10))
+    dispatchMessage(end, gpSender(10))
+    expect(mockChrome.tabs.sendMessage.mock.calls.map((call) => call[1])).toEqual([end, page(1), page(0)])
+  })
+})

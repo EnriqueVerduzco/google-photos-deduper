@@ -4,6 +4,8 @@ import type {
   AppMessage,
   GptkResultChunkMessage,
   GptkResultMessage,
+  GptkMediaPageMessage,
+  GptkMediaCompleteMessage,
 } from "../lib/types"
 
 // Bridge content script (ISOLATED world) for Google Photos pages.
@@ -30,11 +32,14 @@ function reportRelayFailure(msg: AppMessage, error: unknown): void {
     detail
   )
 
-  if (msg.action !== "gptkResult" && msg.action !== "gptkResultChunk") return
+  if (msg.action !== "gptkResult" && msg.action !== "gptkResultChunk" &&
+      msg.action !== "gptkMediaPage" && msg.action !== "gptkMediaComplete") return
 
   const { command, requestId } = msg as
     | GptkResultMessage
     | GptkResultChunkMessage
+    | GptkMediaPageMessage
+    | GptkMediaCompleteMessage
 
   try {
     // Deliberately tiny, so it cannot fail for the same reason the original did.
@@ -84,6 +89,8 @@ window.addEventListener("message", (event) => {
   if (
     msg.action === "gptkResult" ||
     msg.action === "gptkResultChunk" ||
+    msg.action === "gptkMediaPage" ||
+    msg.action === "gptkMediaComplete" ||
     msg.action === "gptkProgress" ||
     msg.action === "gptkLog"
   ) {

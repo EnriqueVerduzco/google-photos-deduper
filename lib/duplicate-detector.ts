@@ -9,7 +9,11 @@
 import type { GpdMediaItem, DuplicateGroup } from "./types";
 import { buildThumbUrl } from "./photo-url";
 import { StabilityTracker } from "./scan-log";
-import type { ScanLogger } from "./scan-log";
+import type { ScanLogger, ThumbnailDownloadMetrics } from "./scan-log";
+import { topK } from "./top-k";
+import { fullDetectionWorkTotal } from "./full-matcher";
+
+export { topK } from "./top-k";
 
 /**
  * Select the best item to keep from a duplicate group.
@@ -180,6 +184,7 @@ export async function fullDetectDuplicates(
   onProgress?: ProgressCallback,
   signal?: AbortSignal,
   logger?: ScanLogger,
+  thumbnailConcurrency = 10,
 ): Promise<{ groups: DuplicateGroup[]; timing: ScanTiming }> {
   const scanStart = performance.now();
 
@@ -243,16 +248,15 @@ export async function fullDetectDuplicates(
 
   // Step 1: Download thumbnails — skip items whose embedding is already cached
   const t1 = performance.now();
-  const blobs = await fetchThumbnails(
+  const { blobs } = await fetchThumbnails(
     candidates,
     cachedKeySet,
     trackedProgress,
     signal,
+    thumbnailConcurrency,
+    logger,
   );
   const fetchThumbnailsMs = Math.round(performance.now() - t1);
-  console.log(
-    `[GPD] fetchThumbnails: ${candidates.length - cacheHits} items in ${fetchThumbnailsMs}ms`,
-  );
   await logger?.phaseComplete("fetchThumbnailsMs", fetchThumbnailsMs);
 
   signal?.throwIfAborted();
@@ -284,7 +288,11 @@ export async function fullDetectDuplicates(
   // The setTimeout(0) yield lets React flush the phase change to "detecting_duplicates"
   // before the worker is dispatched, so the UI updates before the long computation begins.
   // Progress updates come from the worker during detection.
-  trackedProgress({ phase: "detecting_duplicates", current: 0, total: 0 });
+  trackedProgress({
+    phase: "detecting_duplicates",
+    current: 0,
+    total: fullDetectionWorkTotal(embeddings.length),
+  });
   await new Promise<void>((r) => setTimeout(r, 0));
   const workerUrl = chrome.runtime.getURL("scripts/embedder-worker.js");
   const timestamps = validIndices.map(
@@ -489,6 +497,7 @@ export async function smartDetectDuplicates(
   onProgress?: ProgressCallback,
   signal?: AbortSignal,
   logger?: ScanLogger,
+  thumbnailConcurrency = 10,
 ): Promise<DuplicateGroup[]> {
   const scanStart = performance.now();
 
@@ -546,11 +555,15 @@ export async function smartDetectDuplicates(
   };
 
   const t1 = performance.now();
-  const blobs = await fetchThumbnails(subset, cachedKeySet, trackedProgress, signal);
-  const fetchThumbnailsMs = Math.round(performance.now() - t1);
-  console.log(
-    `[GPD] fetchThumbnails: ${subset.length - cacheHits} items in ${fetchThumbnailsMs}ms`,
+  const { blobs } = await fetchThumbnails(
+    subset,
+    cachedKeySet,
+    trackedProgress,
+    signal,
+    thumbnailConcurrency,
+    logger,
   );
+  const fetchThumbnailsMs = Math.round(performance.now() - t1);
   await logger?.phaseComplete("fetchThumbnailsMs", fetchThumbnailsMs);
 
   signal?.throwIfAborted();
@@ -628,16 +641,67 @@ export async function smartDetectDuplicates(
 // Step 1: Fetch thumbnails
 // ============================================================
 
-async function fetchThumbnails(
+const DEFAULT_THUMBNAIL_CONCURRENCY = 10;
+const ALLOWED_THUMBNAIL_CONCURRENCY = new Set([10, 12, 16]);
+const THUMBNAIL_FETCH_TIMEOUT_MS = 8000;
+const THUMBNAIL_MAX_RETRIES = 2;
+const THUMBNAIL_RETRY_BASE_MS = 100;
+
+function normalizeThumbnailConcurrency(value: number): number {
+  return ALLOWED_THUMBNAIL_CONCURRENCY.has(value)
+    ? value
+    : DEFAULT_THUMBNAIL_CONCURRENCY;
+}
+
+function waitForRetry(ms: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timeoutId);
+      reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export interface FetchThumbnailsResult {
+  blobs: (Blob | null)[];
+  metrics: ThumbnailDownloadMetrics;
+}
+
+/**
+ * Download uncached thumbnails with bounded concurrency and retries.
+ * Exported so reliability/cancellation behavior can be unit tested without
+ * invoking MediaPipe or accessing Google Photos.
+ */
+export async function fetchThumbnails(
   items: GpdMediaItem[],
   cachedKeySet: Set<string>,
   onProgress?: ProgressCallback,
   signal?: AbortSignal,
-): Promise<(Blob | null)[]> {
-  const concurrency = 10;
-  const fetchTimeoutMs = 8000;
+  requestedConcurrency = DEFAULT_THUMBNAIL_CONCURRENCY,
+  logger?: ScanLogger,
+): Promise<FetchThumbnailsResult> {
+  const concurrency = normalizeThumbnailConcurrency(requestedConcurrency);
   const blobs: (Blob | null)[] = new Array(items.length).fill(null);
   let completed = 0;
+  const startedAt = performance.now();
+  const metrics: ThumbnailDownloadMetrics = {
+    concurrency,
+    attempts: 0,
+    successes: 0,
+    failures: 0,
+    httpStatusFailures: 0,
+    throttledResponses: 0,
+    timeouts: 0,
+    retries: 0,
+    elapsedMs: 0,
+    effectivePerSecond: 0,
+  };
 
   // Only enqueue items that don't have a cached embedding
   const queue = items
@@ -660,40 +724,107 @@ async function fetchThumbnails(
     }
   };
 
+  const download = async (entry: { item: GpdMediaItem; index: number }) => {
+    const url = buildThumbUrl(entry.item.thumb, { height: THUMB_HEIGHT });
+    let lastFailure = "unknown error";
+
+    for (let attempt = 0; attempt <= THUMBNAIL_MAX_RETRIES; attempt++) {
+      signal?.throwIfAborted();
+      metrics.attempts++;
+
+      const attemptController = new AbortController();
+      let timedOut = false;
+      const onCancel = () => attemptController.abort(signal?.reason);
+      signal?.addEventListener("abort", onCancel, { once: true });
+      const timeoutId = setTimeout(() => {
+        timedOut = true;
+        attemptController.abort(
+          new DOMException("Thumbnail download timed out", "TimeoutError"),
+        );
+      }, THUMBNAIL_FETCH_TIMEOUT_MS);
+
+      let shouldRetry = false;
+      try {
+        const response = await fetch(url, {
+          credentials: "include",
+          signal: attemptController.signal,
+        });
+        if (response.ok) {
+          blobs[entry.index] = await response.blob();
+          metrics.successes++;
+          return;
+        }
+
+        metrics.httpStatusFailures++;
+        if (response.status === 429) metrics.throttledResponses++;
+        lastFailure = `HTTP ${response.status}`;
+        void response.body?.cancel().catch(() => {});
+        shouldRetry = response.status === 429 || response.status >= 500;
+      } catch (error) {
+        // A user cancellation takes precedence over timeout/network handling.
+        signal?.throwIfAborted();
+        if (timedOut) {
+          metrics.timeouts++;
+          lastFailure = "timeout";
+        } else {
+          lastFailure = error instanceof Error ? error.message : String(error);
+        }
+        // Fetch rejections other than user cancellation are transient network
+        // failures and are eligible for a bounded retry.
+        shouldRetry = true;
+      } finally {
+        clearTimeout(timeoutId);
+        signal?.removeEventListener("abort", onCancel);
+      }
+
+      if (!shouldRetry || attempt === THUMBNAIL_MAX_RETRIES) break;
+      metrics.retries++;
+      await waitForRetry(THUMBNAIL_RETRY_BASE_MS * 2 ** attempt, signal);
+    }
+
+    metrics.failures++;
+    console.warn(
+      `[GPD] thumbnail failed: mediaKey=${entry.item.mediaKey}, reason=${lastFailure}`,
+    );
+  };
+
   const worker = async () => {
     while (queue.length > 0) {
       signal?.throwIfAborted();
       const entry = queue.shift();
       if (!entry) break;
 
-      try {
-        const url = buildThumbUrl(entry.item.thumb, { height: THUMB_HEIGHT });
-        const response = await fetch(url, {
-          credentials: "include",
-          signal: (AbortSignal as typeof AbortSignal & { any(signals: AbortSignal[]): AbortSignal }).any([
-            AbortSignal.timeout(fetchTimeoutMs),
-            ...(signal ? [signal] : []),
-          ]),
-        });
-        if (response.ok) {
-          blobs[entry.index] = await response.blob();
-        } else {
-          response.body?.cancel();
-        }
-      } catch (e) {
-        if (e instanceof DOMException && e.name === "AbortError") throw e;
-        // Skip other failed downloads (timeouts, network errors, rate limits)
-      }
+      await download(entry);
 
       completed++;
       reportProgress();
     }
   };
 
-  const workers = Array.from({ length: concurrency }, () => worker());
-  await Promise.all(workers);
-
-  return blobs;
+  try {
+    const workers = Array.from(
+      { length: Math.min(concurrency, queue.length) },
+      () => worker(),
+    );
+    await Promise.all(workers);
+    return { blobs, metrics };
+  } finally {
+    metrics.elapsedMs = Math.round(performance.now() - startedAt);
+    metrics.effectivePerSecond =
+      metrics.elapsedMs > 0
+        ? Math.round((metrics.successes / (metrics.elapsedMs / 1000)) * 100) /
+          100
+        : 0;
+    console.log(
+      `[GPD] thumbnails: concurrency=${metrics.concurrency}, attempts=${metrics.attempts}, ` +
+        `successful=${metrics.successes}, failed=${metrics.failures}, ` +
+        `httpFailures=${metrics.httpStatusFailures}, throttled=${metrics.throttledResponses}, ` +
+        `timeouts=${metrics.timeouts}, ` +
+        `retries=${metrics.retries}, elapsed=${metrics.elapsedMs}ms, ` +
+        `rate=${metrics.effectivePerSecond}/sec`,
+    );
+    await logger?.recordThumbnailDownloads(metrics);
+  }
 }
 
 // ============================================================
@@ -886,7 +1017,7 @@ async function computeEmbeddings(
  * Embeddings are packed into a single transferable Float32Array and sent
  * to the worker. The worker returns number[][] (the group index lists).
  */
-async function runCommunityDetectionInWorker(
+export async function runCommunityDetectionInWorker(
   embeddings: Float32Array[],
   threshold: number,
   timestamps: number[],
@@ -894,6 +1025,7 @@ async function runCommunityDetectionInWorker(
   onProgress?: ProgressCallback,
   signal?: AbortSignal,
 ): Promise<number[][]> {
+  signal?.throwIfAborted();
   const n = embeddings.length;
   if (n === 0) return [];
   const dim = embeddings[0].length;
@@ -1037,127 +1169,4 @@ export function matMul(
   }
 
   return result;
-}
-
-/**
- * Find top-k largest values and their indices in a Float32Array.
- * Uses min-heap for small k (O(n log k)) and quickselect for large k (O(n) average).
- *
- * Exported for unit testing.
- */
-export function topK(
-  arr: Float32Array,
-  k: number,
-): { values: number[]; indices: number[] } {
-  const n = arr.length;
-  k = Math.min(k, n);
-  if (k <= 0) return { values: [], indices: [] };
-
-  // For small k, use min-heap — O(n log k) with low constant factor, no object allocation
-  if (k <= 50) {
-    const hVals = new Float32Array(k);
-    const hIdxs = new Uint32Array(k);
-    let size = 0;
-
-    const siftDown = (pos: number) => {
-      while (true) {
-        let smallest = pos;
-        const l = 2 * pos + 1;
-        const r = l + 1;
-        if (l < size && hVals[l] < hVals[smallest]) smallest = l;
-        if (r < size && hVals[r] < hVals[smallest]) smallest = r;
-        if (smallest === pos) break;
-        let tmp = hVals[pos];
-        hVals[pos] = hVals[smallest];
-        hVals[smallest] = tmp;
-        let ti = hIdxs[pos];
-        hIdxs[pos] = hIdxs[smallest];
-        hIdxs[smallest] = ti;
-        pos = smallest;
-      }
-    };
-
-    for (let i = 0; i < n; i++) {
-      const v = arr[i];
-      if (size < k) {
-        hVals[size] = v;
-        hIdxs[size] = i;
-        size++;
-        for (let p = (size >> 1) - 1; p >= 0; p--) siftDown(p);
-      } else if (v > hVals[0]) {
-        hVals[0] = v;
-        hIdxs[0] = i;
-        siftDown(0);
-      }
-    }
-
-    // Pop from heap into descending order
-    const values: number[] = new Array(size);
-    const indices: number[] = new Array(size);
-    for (let i = size - 1; i >= 0; i--) {
-      values[i] = hVals[0];
-      indices[i] = hIdxs[0];
-      hVals[0] = hVals[--size];
-      hIdxs[0] = hIdxs[size];
-      siftDown(0);
-    }
-    return { values, indices };
-  }
-
-  // For larger k, use quickselect — O(n) average
-  const vals = new Float32Array(n);
-  const idxs = new Uint32Array(n);
-  for (let i = 0; i < n; i++) {
-    vals[i] = arr[i];
-    idxs[i] = i;
-  }
-
-  let lo = 0,
-    hi = n - 1;
-  while (lo < hi) {
-    const pivot = vals[hi];
-    let p = lo;
-    for (let i = lo; i < hi; i++) {
-      if (vals[i] >= pivot) {
-        let tv = vals[p];
-        vals[p] = vals[i];
-        vals[i] = tv;
-        let ti = idxs[p];
-        idxs[p] = idxs[i];
-        idxs[i] = ti;
-        p++;
-      }
-    }
-    let tv = vals[p];
-    vals[p] = vals[hi];
-    vals[hi] = tv;
-    let ti = idxs[p];
-    idxs[p] = idxs[hi];
-    idxs[hi] = ti;
-    if (p === k - 1) break;
-    if (p < k - 1) lo = p + 1;
-    else hi = p - 1;
-  }
-
-  // Insertion sort the top-k partition for descending order
-  for (let i = 1; i < k; i++) {
-    const v = vals[i];
-    const ix = idxs[i];
-    let j = i - 1;
-    while (j >= 0 && vals[j] < v) {
-      vals[j + 1] = vals[j];
-      idxs[j + 1] = idxs[j];
-      j--;
-    }
-    vals[j + 1] = v;
-    idxs[j + 1] = ix;
-  }
-
-  const values: number[] = new Array(k);
-  const indices: number[] = new Array(k);
-  for (let i = 0; i < k; i++) {
-    values[i] = vals[i];
-    indices[i] = idxs[i];
-  }
-  return { values, indices };
 }

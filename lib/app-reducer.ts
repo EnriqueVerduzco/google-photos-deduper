@@ -131,10 +131,17 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       // has already triggered the downloading/computing phases. Drop those stale counts
       // to prevent the bar from jumping backwards.
       if (action.phase === undefined && state.phase !== "fetching") return state
+      const nextPhase = action.phase ?? state.phase
+      const phaseChanged = nextPhase !== state.phase
       return {
         ...state,
-        ...(action.phase !== undefined ? { phase: action.phase } : {}),
-        itemsProcessed: action.payload.itemsProcessed,
+        ...(action.phase !== undefined ? { phase: nextPhase } : {}),
+        // Progress messages may be relayed out of order. Never let an older
+        // count move the display backwards within the same phase, while still
+        // allowing a new phase to reset its counter.
+        itemsProcessed: phaseChanged
+          ? action.payload.itemsProcessed
+          : Math.max(state.itemsProcessed, action.payload.itemsProcessed),
         ...(action.totalItems !== undefined ? { totalEstimate: action.totalItems } : {}),
         message: action.payload.message || state.message,
       }

@@ -4002,6 +4002,291 @@
     return cc(Zc, t2, e2);
   }, Zc.POSE_CONNECTIONS = Cc;
 
+  // lib/cosine-threshold.ts
+  var DISTANCE_EPSILON = 1e-7;
+  var DISTANCE_BLOCK_SIZE = 16;
+  function computeSquaredNorms(embeddings) {
+    const norms = new Float64Array(embeddings.length);
+    for (let i2 = 0; i2 < embeddings.length; i2++) {
+      let norm = 0;
+      const embedding = embeddings[i2];
+      for (let k2 = 0; k2 < embedding.length; k2++) {
+        norm += embedding[k2] * embedding[k2];
+      }
+      norms[i2] = norm;
+    }
+    return norms;
+  }
+  function thresholdedCosine(aRow, bRow, dim, threshold, normA, normB) {
+    const maxSquaredDistance = normA + normB - 2 * threshold;
+    let squaredDistance = 0;
+    let rejected = maxSquaredDistance < -DISTANCE_EPSILON;
+    for (let blockStart = 0; !rejected && blockStart < dim; blockStart += DISTANCE_BLOCK_SIZE) {
+      const blockEnd = Math.min(blockStart + DISTANCE_BLOCK_SIZE, dim);
+      for (let k2 = blockStart; k2 < blockEnd; k2++) {
+        const difference = aRow[k2] - bRow[k2];
+        squaredDistance += difference * difference;
+      }
+      if (squaredDistance > maxSquaredDistance + DISTANCE_EPSILON) {
+        rejected = true;
+      }
+    }
+    if (rejected) return Math.fround(threshold - 1);
+    let dot = 0;
+    for (let k2 = 0; k2 < dim; k2++) dot += aRow[k2] * bRow[k2];
+    return Math.fround(dot);
+  }
+
+  // lib/top-k.ts
+  function topK(arr, k2) {
+    const n2 = arr.length;
+    k2 = Math.min(k2, n2);
+    if (k2 <= 0) return { values: [], indices: [] };
+    if (k2 <= 50) {
+      const hVals = new Float32Array(k2);
+      const hIdxs = new Uint32Array(k2);
+      let size = 0;
+      const siftDown = (pos) => {
+        while (true) {
+          let smallest = pos;
+          const left = 2 * pos + 1;
+          const right = left + 1;
+          if (left < size && hVals[left] < hVals[smallest]) smallest = left;
+          if (right < size && hVals[right] < hVals[smallest]) smallest = right;
+          if (smallest === pos) break;
+          const value = hVals[pos];
+          hVals[pos] = hVals[smallest];
+          hVals[smallest] = value;
+          const index = hIdxs[pos];
+          hIdxs[pos] = hIdxs[smallest];
+          hIdxs[smallest] = index;
+          pos = smallest;
+        }
+      };
+      for (let i2 = 0; i2 < n2; i2++) {
+        const value = arr[i2];
+        if (size < k2) {
+          hVals[size] = value;
+          hIdxs[size] = i2;
+          size++;
+          for (let pos = (size >> 1) - 1; pos >= 0; pos--) siftDown(pos);
+        } else if (value > hVals[0]) {
+          hVals[0] = value;
+          hIdxs[0] = i2;
+          siftDown(0);
+        }
+      }
+      const values2 = new Array(size);
+      const indices2 = new Array(size);
+      for (let i2 = size - 1; i2 >= 0; i2--) {
+        values2[i2] = hVals[0];
+        indices2[i2] = hIdxs[0];
+        hVals[0] = hVals[--size];
+        hIdxs[0] = hIdxs[size];
+        siftDown(0);
+      }
+      return { values: values2, indices: indices2 };
+    }
+    const valuesBuffer = new Float32Array(n2);
+    const indicesBuffer = new Uint32Array(n2);
+    for (let i2 = 0; i2 < n2; i2++) {
+      valuesBuffer[i2] = arr[i2];
+      indicesBuffer[i2] = i2;
+    }
+    let low = 0;
+    let high = n2 - 1;
+    while (low < high) {
+      const pivot = valuesBuffer[high];
+      let partition = low;
+      for (let i2 = low; i2 < high; i2++) {
+        if (valuesBuffer[i2] >= pivot) {
+          let value2 = valuesBuffer[partition];
+          valuesBuffer[partition] = valuesBuffer[i2];
+          valuesBuffer[i2] = value2;
+          let index2 = indicesBuffer[partition];
+          indicesBuffer[partition] = indicesBuffer[i2];
+          indicesBuffer[i2] = index2;
+          partition++;
+        }
+      }
+      let value = valuesBuffer[partition];
+      valuesBuffer[partition] = valuesBuffer[high];
+      valuesBuffer[high] = value;
+      let index = indicesBuffer[partition];
+      indicesBuffer[partition] = indicesBuffer[high];
+      indicesBuffer[high] = index;
+      if (partition === k2 - 1) break;
+      if (partition < k2 - 1) low = partition + 1;
+      else high = partition - 1;
+    }
+    for (let i2 = 1; i2 < k2; i2++) {
+      const value = valuesBuffer[i2];
+      const index = indicesBuffer[i2];
+      let j2 = i2 - 1;
+      while (j2 >= 0 && valuesBuffer[j2] < value) {
+        valuesBuffer[j2 + 1] = valuesBuffer[j2];
+        indicesBuffer[j2 + 1] = indicesBuffer[j2];
+        j2--;
+      }
+      valuesBuffer[j2 + 1] = value;
+      indicesBuffer[j2 + 1] = index;
+    }
+    const values = new Array(k2);
+    const indices = new Array(k2);
+    for (let i2 = 0; i2 < k2; i2++) {
+      values[i2] = valuesBuffer[i2];
+      indices[i2] = indicesBuffer[i2];
+    }
+    return { values, indices };
+  }
+
+  // lib/full-matcher.ts
+  function fullDetectionWorkTotal(n2) {
+    return n2 * (n2 - 1) / 2 + 3 * n2;
+  }
+  async function fullCommunityDetection(embeddings, threshold, options = {}) {
+    const { onProgress, signal, stats } = options;
+    const n2 = embeddings.length;
+    const total = fullDetectionWorkTotal(n2);
+    let completed = 0;
+    let lastYield = performance.now();
+    signal?.throwIfAborted();
+    onProgress?.(0, total);
+    if (stats)
+      Object.assign(stats, {
+        pairComparisons: 0,
+        selfComparisons: 0,
+        matchEntries: 0,
+        boundaryEntries: 0,
+        scratchBytes: 0
+      });
+    if (n2 < 2) {
+      signal?.throwIfAborted();
+      onProgress?.(total, total);
+      return [];
+    }
+    const pause = async () => {
+      signal?.throwIfAborted();
+      onProgress?.(completed, total);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      signal?.throwIfAborted();
+      lastYield = performance.now();
+    };
+    const dim = embeddings[0].length;
+    const norms = computeSquaredNorms(embeddings);
+    const neighbors = Array.from({ length: n2 }, () => []);
+    const canTie = Math.fround(threshold) === threshold;
+    const scores = canTie ? Array.from({ length: n2 }, () => []) : void 0;
+    const boundaryIndices = canTie ? Array.from({ length: n2 }, () => []) : void 0;
+    const boundaryScores = canTie ? Array.from({ length: n2 }, () => []) : void 0;
+    const rejectedScore = Math.fround(threshold - 1);
+    const remember = (i2, j2, score) => {
+      if (score >= threshold) {
+        neighbors[i2].push(j2);
+        scores?.[i2].push(score);
+        if (stats) stats.matchEntries++;
+      } else if (canTie && score !== rejectedScore) {
+        boundaryIndices[i2].push(j2);
+        boundaryScores[i2].push(score);
+        if (stats) stats.boundaryEntries++;
+      }
+    };
+    const compareSlice = (i2, start, end) => {
+      const row = embeddings[i2];
+      const norm = norms[i2];
+      for (let j2 = start; j2 < end; j2++) {
+        const score = thresholdedCosine(
+          row,
+          embeddings[j2],
+          dim,
+          threshold,
+          norm,
+          norms[j2]
+        );
+        if (score >= threshold || canTie && score !== rejectedScore) {
+          remember(i2, j2, score);
+          remember(j2, i2, score);
+        }
+      }
+    };
+    for (let i2 = 0; i2 < n2; i2++) {
+      signal?.throwIfAborted();
+      remember(
+        i2,
+        i2,
+        thresholdedCosine(
+          embeddings[i2],
+          embeddings[i2],
+          dim,
+          threshold,
+          norms[i2],
+          norms[i2]
+        )
+      );
+      if (stats) stats.selfComparisons++;
+      completed++;
+      for (let start = i2 + 1; start < n2; start += 512) {
+        const end = Math.min(start + 512, n2);
+        compareSlice(i2, start, end);
+        completed += end - start;
+        if (stats) stats.pairComparisons += end - start;
+        if (performance.now() - lastYield >= 32) await pause();
+      }
+    }
+    let sortMaxSize = Math.min(50, n2);
+    let scratch;
+    for (let i2 = 0; i2 < n2; i2++) {
+      signal?.throwIfAborted();
+      const members = neighbors[i2];
+      if (canTie && members.length >= 2) {
+        let strictlyAbove = 0;
+        for (const score of scores[i2]) if (score > threshold) strictlyAbove++;
+        while (strictlyAbove >= sortMaxSize && sortMaxSize < n2) {
+          sortMaxSize = Math.min(2 * sortMaxSize, n2);
+        }
+        if (members.length > sortMaxSize) {
+          scratch ?? (scratch = new Float32Array(n2));
+          scratch.fill(rejectedScore);
+          for (let k2 = 0; k2 < members.length; k2++) {
+            scratch[members[k2]] = scores[i2][k2];
+          }
+          for (let k2 = 0; k2 < boundaryIndices[i2].length; k2++) {
+            scratch[boundaryIndices[i2][k2]] = boundaryScores[i2][k2];
+          }
+          neighbors[i2] = topK(scratch, sortMaxSize).indices.sort((a2, b2) => a2 - b2);
+          if (stats)
+            stats.scratchBytes = n2 * 4 + (sortMaxSize > 50 ? n2 * 8 : sortMaxSize * 8);
+        }
+      }
+      if (scores) {
+        scores[i2] = [];
+        boundaryIndices[i2] = [];
+        boundaryScores[i2] = [];
+      }
+      completed++;
+      if (performance.now() - lastYield >= 32) await pause();
+    }
+    neighbors.sort((a2, b2) => b2.length - a2.length);
+    const assigned = new Uint8Array(n2);
+    const groups = [];
+    for (const community of neighbors) {
+      signal?.throwIfAborted();
+      if (community.length >= 2) {
+        const remaining = community.filter((index) => !assigned[index]);
+        if (remaining.length >= 2) {
+          groups.push(remaining);
+          for (const index of remaining) assigned[index] = 1;
+        }
+      }
+      completed++;
+      if (performance.now() - lastYield >= 32) await pause();
+    }
+    groups.sort((a2, b2) => b2.length - a2.length);
+    signal?.throwIfAborted();
+    onProgress?.(total, total);
+    return groups;
+  }
+
   // workers/embedder.worker.ts
   var embedder = null;
   self.addEventListener("message", async (event) => {
@@ -4050,19 +4335,16 @@
       self.postMessage({ type: "results", results }, transferables);
     }
     if (type === "detect") {
-      const { flatEmbeddings, n: n2, dim, threshold, timestamps } = data;
+      const { flatEmbeddings, n: n2, dim, threshold } = data;
       const embeddings = [];
       for (let i2 = 0; i2 < n2; i2++) {
         embeddings.push(flatEmbeddings.subarray(i2 * dim, (i2 + 1) * dim));
       }
-      const groups = await workerCommunityDetection(
-        embeddings,
-        threshold,
-        timestamps,
-        (current, total) => {
+      const groups = await fullCommunityDetection(embeddings, threshold, {
+        onProgress: (current, total) => {
           self.postMessage({ type: "detectionProgress", current, total });
         }
-      );
+      });
       self.postMessage({ type: "detectionResults", groups });
     }
     if (type === "detectSmart") {
@@ -4101,77 +4383,4 @@
       self.postMessage({ type: "detectionResults", groups: allGroups });
     }
   });
-  async function workerCommunityDetection(embeddings, threshold, _timestamps, onProgress) {
-    const n2 = embeddings.length;
-    const dim = embeddings[0].length;
-    const batchSize = 128;
-    const minCommunitySize = 2;
-    const extractedCommunities = [];
-    let sortMaxSize = Math.min(Math.max(2 * minCommunitySize, 50), n2);
-    for (let startIdx = 0; startIdx < n2; startIdx += batchSize) {
-      const endIdx = Math.min(startIdx + batchSize, n2);
-      const batchLen = endIdx - startIdx;
-      const cosScores = matMul(embeddings, startIdx, endIdx, embeddings, 0, n2, dim);
-      for (let i2 = 0; i2 < batchLen; i2++) {
-        const row = cosScores.subarray(i2 * n2, (i2 + 1) * n2);
-        const topKMin = topK(row, minCommunitySize);
-        if (topKMin.values[topKMin.values.length - 1] < threshold) continue;
-        let topKResult = topK(row, sortMaxSize);
-        while (topKResult.values[topKResult.values.length - 1] > threshold && sortMaxSize < n2) {
-          sortMaxSize = Math.min(2 * sortMaxSize, n2);
-          topKResult = topK(row, sortMaxSize);
-        }
-        const cluster = [];
-        for (let j2 = 0; j2 < topKResult.values.length; j2++) {
-          if (topKResult.values[j2] < threshold) break;
-          cluster.push(topKResult.indices[j2]);
-        }
-        if (cluster.length >= minCommunitySize) {
-          extractedCommunities.push(cluster);
-        }
-      }
-      onProgress?.(endIdx, n2);
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    }
-    extractedCommunities.sort((a2, b2) => b2.length - a2.length);
-    const uniqueCommunities = [];
-    const assignedIds = /* @__PURE__ */ new Set();
-    for (const community of extractedCommunities) {
-      const nonOverlapping = community.slice().sort((a2, b2) => a2 - b2).filter((idx) => !assignedIds.has(idx));
-      if (nonOverlapping.length >= minCommunitySize) {
-        uniqueCommunities.push(nonOverlapping);
-        for (const idx of nonOverlapping) assignedIds.add(idx);
-      }
-    }
-    uniqueCommunities.sort((a2, b2) => b2.length - a2.length);
-    return uniqueCommunities;
-  }
-  function matMul(A2, startA, endA, B2, startB, endB, dim) {
-    const rowsA = endA - startA;
-    const rowsB = endB - startB;
-    const result = new Float32Array(rowsA * rowsB);
-    for (let i2 = 0; i2 < rowsA; i2++) {
-      const aRow = A2[startA + i2];
-      for (let j2 = 0; j2 < rowsB; j2++) {
-        const bRow = B2[startB + j2];
-        let dot = 0;
-        for (let k2 = 0; k2 < dim; k2++) dot += aRow[k2] * bRow[k2];
-        result[i2 * rowsB + j2] = dot;
-      }
-    }
-    return result;
-  }
-  function topK(arr, k2) {
-    k2 = Math.min(k2, arr.length);
-    const indexed = [];
-    for (let i2 = 0; i2 < arr.length; i2++) indexed.push({ val: arr[i2], idx: i2 });
-    indexed.sort((a2, b2) => b2.val - a2.val);
-    const values = [];
-    const indices = [];
-    for (let i2 = 0; i2 < k2; i2++) {
-      values.push(indexed[i2].val);
-      indices.push(indexed[i2].idx);
-    }
-    return { values, indices };
-  }
 })();

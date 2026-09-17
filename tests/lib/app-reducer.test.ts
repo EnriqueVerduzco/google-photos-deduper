@@ -146,6 +146,52 @@ describe("SCAN_STARTED", () => {
   })
 })
 
+describe("SCAN_PROGRESS", () => {
+  const scanningState: AppState = {
+    status: "scanning",
+    phase: "fetching",
+    itemsProcessed: 500,
+    totalEstimate: 0,
+    message: "Fetching",
+    requestId: "req-1",
+    hasGptk: true,
+  }
+
+  it("does not move backwards when same-phase progress arrives out of order", () => {
+    const next = appReducer(scanningState, {
+      type: "SCAN_PROGRESS",
+      payload: {
+        app: APP_ID,
+        action: "gptkProgress",
+        requestId: "req-1",
+        itemsProcessed: 250,
+      },
+    })
+
+    expect(next).toMatchObject({ phase: "fetching", itemsProcessed: 500 })
+  })
+
+  it("allows a new phase to reset its progress counter", () => {
+    const next = appReducer(scanningState, {
+      type: "SCAN_PROGRESS",
+      phase: "downloading_thumbnails",
+      totalItems: 1000,
+      payload: {
+        app: APP_ID,
+        action: "gptkProgress",
+        requestId: "req-1",
+        itemsProcessed: 0,
+      },
+    })
+
+    expect(next).toMatchObject({
+      phase: "downloading_thumbnails",
+      itemsProcessed: 0,
+      totalEstimate: 1000,
+    })
+  })
+})
+
 describe("SCAN_COMPLETE", () => {
   it("sets results with correct totalItems count", () => {
     const next = appReducer(

@@ -35,7 +35,9 @@ import { selectDefaultKeep } from "../lib/duplicate-detector"
 import { ScanLogger } from "../lib/scan-log"
 import theme from "../lib/theme"
 import { APP_ID, DEFAULT_SETTINGS } from "../lib/types"
-import { areScanResultsValid } from "../lib/scan-results"
+import { loadMediaIndex, mergeMediaItems, normalizeAccount, patchMediaIndex, saveMediaIndex } from "../lib/media-index"
+import { MediaStream } from "../lib/media-stream"
+import type { MediaFetchLog } from "../lib/scan-log"
 import type {
   AppMessage,
   DuplicateGroup,
@@ -44,6 +46,8 @@ import type {
   GptkResultChunkMessage,
   GptkResultMessage,
   HealthCheckResultMessage,
+  GptkMediaCompleteMessage,
+  MediaFetchMetrics,
   ScanSettings,
   StoredState
 } from "../lib/types"
@@ -119,6 +123,7 @@ export default function App() {
     totalItems: number
   } | null>(null)
   const pendingDedupKeysRef = useRef<string[] | null>(null)
+  const pendingTrashAccountRef = useRef<{ requestId: string; accountEmail?: string } | null>(null)
 
   // AbortController for the current scan (cancelled on user request or new scan)
   const scanAbortRef = useRef<AbortController | null>(null)
@@ -128,6 +133,20 @@ export default function App() {
 
   // Cached media items from previous scan, used to merge with incremental fetch
   const cachedMediaItemsRef = useRef<Record<string, GpdMediaItem> | null>(null)
+
+  const mediaStreamRef = useRef<MediaStream | null>(null)
+  const fetchContextRef = useRef<{
+    requestId: string
+    accountEmail?: string
+    startedAt: number
+    completing: boolean
+    metrics: MediaFetchLog
+    logger: ScanLogger
+  } | null>(null)
+  const pendingRestoresRef = useRef(new Map<string, {
+    accountEmail?: string
+    items: GpdMediaItem[]
+  }>())
 
   // Tracks the requestId of the active scan so stale results from previous
   // scans killed by reload can be dropped (they arrive late from the GP tab)
@@ -162,6 +181,12 @@ export default function App() {
       currentScanRequestIdRef.current = null
       resultChunksRef.current = {}
       scanAbortRef.current?.abort()
+      mediaStreamRef.current = null
+      const context = fetchContextRef.current
+      if (context) {
+        void context.logger.recordMediaFetch({ ...context.metrics, totalFetchMs: performance.now() - context.startedAt })
+          .then(() => context.logger.finalize("error", { error: "Media fetch watchdog timed out" }))
+      }
       dispatch({
         type: "SCAN_ERROR",
         error:
@@ -228,31 +253,60 @@ export default function App() {
   useEffect(() => {
     // Shared tail of a completed getAllMediaItems fetch, however it arrived
     // (chunked, or as a single legacy gptkResult).
-    const completeMediaFetch = (fetched: GpdMediaItem[]) => {
-      // Fetching is done; detection reports progress through its own path.
+    const failMediaFetch = (error: string, metrics?: MediaFetchMetrics) => {
       clearFetchWatchdog()
-      let items = fetched
-      const cached = cachedMediaItemsRef.current
-      if (cached && Object.keys(cached).length > 0) {
-        // Merge: new items take precedence over cached (handles field updates)
-        const newItemKeys = new Set(items.map((i) => i.mediaKey))
-        const cachedOnly = Object.values(cached).filter(
-          (i) => !newItemKeys.has(i.mediaKey)
-        )
-        items = [...items, ...cachedOnly]
-        console.log(
-          `[GPD] media items: ${fetched.length} new + ${cachedOnly.length} cached = ${items.length} total`
-        )
-        cachedMediaItemsRef.current = null
+      const context = fetchContextRef.current
+      currentScanRequestIdRef.current = null
+      mediaStreamRef.current = null
+      resultChunksRef.current = {}
+      cachedMediaItemsRef.current = null
+      scanAbortRef.current?.abort()
+      if (context) {
+        void context.logger.recordMediaFetch({
+          ...context.metrics, ...metrics, totalFetchMs: performance.now() - context.startedAt
+        }).then(() => context.logger.finalize("error", { error }))
       }
-      dispatch({
-        type: "SCAN_MEDIA_FETCHED",
-        mediaItems: items
-      })
-      runDuplicateDetection(
-        items,
-        scanAbortRef.current?.signal ?? new AbortController().signal
-      )
+      dispatch({ type: "SCAN_ERROR", error })
+    }
+
+    const completeMediaFetch = async (
+      fetched: GpdMediaItem[],
+      completion?: GptkMediaCompleteMessage,
+      finalTransferMs?: number
+    ) => {
+      const context = fetchContextRef.current
+      if (!context || context.completing || context.requestId !== currentScanRequestIdRef.current) return
+      context.completing = true
+      clearFetchWatchdog()
+      if (completion && context.accountEmail &&
+          normalizeAccount(completion.accountEmail) !== normalizeAccount(context.accountEmail)) {
+        failMediaFetch("The Google Photos account changed. Reconnect before scanning.")
+        return
+      }
+      const mergeStart = performance.now()
+      const items = mergeMediaItems(fetched, cachedMediaItemsRef.current)
+      cachedMediaItemsRef.current = null
+      mediaStreamRef.current = null
+      const mergeMs = performance.now() - mergeStart
+      const saveStart = performance.now()
+      // A complete fetch is reusable even if detection is cancelled or finds
+      // no duplicates. Never persist a partial stream or a failed refresh.
+      try {
+        await saveMediaIndex(completion?.accountEmail ?? context.accountEmail, items)
+      } catch (error) {
+        console.warn("[GPD] Could not save media index:", error)
+      }
+      const metrics: MediaFetchLog = {
+        ...context.metrics, ...completion?.metrics, mergedItems: items.length,
+        mergeMs, cacheSaveMs: performance.now() - saveStart, finalTransferMs,
+        totalFetchMs: performance.now() - context.startedAt
+      }
+      context.metrics = metrics
+      await context.logger.recordMediaFetch(metrics, items.length)
+      console.log("[GPD] media fetch:", metrics)
+      if (context.requestId !== currentScanRequestIdRef.current || scanAbortRef.current?.signal.aborted) return
+      dispatch({ type: "SCAN_MEDIA_FETCHED", mediaItems: items })
+      void runDuplicateDetection(items, scanAbortRef.current!.signal)
     }
 
     const listener = (message: AppMessage, sender: chrome.runtime.MessageSender) => {
@@ -292,9 +346,22 @@ export default function App() {
           })
           break
         }
+        case "gptkMediaPage":
+        case "gptkMediaComplete": {
+          if (message.requestId !== currentScanRequestIdRef.current || fetchContextRef.current?.completing) break
+          armFetchWatchdog()
+          try {
+            mediaStreamRef.current ??= new MediaStream()
+            const result = mediaStreamRef.current.accept(message)
+            if (result) void completeMediaFetch(result.items, result.completion, result.finalTransferMs)
+          } catch (error) {
+            failMediaFetch(String(error))
+          }
+          break
+        }
         case "gptkResultChunk": {
           const chunk = message as GptkResultChunkMessage
-          if (chunk.command !== "getAllMediaItems") break
+          if (chunk.command !== "getAllMediaItems" || fetchContextRef.current?.completing) break
           // Drop stale chunks from scans that were killed/cancelled
           if (chunk.requestId !== currentScanRequestIdRef.current) {
             console.warn(
@@ -330,6 +397,7 @@ export default function App() {
         case "gptkResult": {
           const result = message as GptkResultMessage
           if (result.command === "getAllMediaItems") {
+            if (fetchContextRef.current?.completing) break
             // Drop stale results from scans that were killed/cancelled — their
             // GPTK request may have still been in-flight and arrives late
             if (result.requestId !== currentScanRequestIdRef.current) {
@@ -341,16 +409,18 @@ export default function App() {
             if (result.success) {
               completeMediaFetch(result.data as GpdMediaItem[])
             } else {
-              clearFetchWatchdog()
-              dispatch({
-                type: "SCAN_ERROR",
-                error: result.error || "Scan failed"
-              })
+              failMediaFetch(result.error || "Scan failed", result.mediaFetchMetrics)
             }
           } else if (result.command === "trashItems") {
             if (result.success) {
               const data = result.data as { trashedKeys: string[] }
               const trashedKeys = data.trashedKeys || []
+              const pending = pendingTrashAccountRef.current
+              if (pending?.requestId === result.requestId) {
+                pendingTrashAccountRef.current = null
+                void patchMediaIndex(pending.accountEmail, trashedKeys)
+                  .catch((error) => console.warn("[GPD] Could not update media index:", error))
+              }
               dispatch({ type: "TRASH_COMPLETE", trashedKeys })
               // Set undo data from the snapshot captured before trash
               if (preTrashSnapshotRef.current && pendingDedupKeysRef.current) {
@@ -369,6 +439,12 @@ export default function App() {
               })
             }
           } else if (result.command === "restoreItems") {
+            const restore = pendingRestoresRef.current.get(result.requestId)
+            pendingRestoresRef.current.delete(result.requestId)
+            if (result.success && restore) {
+              void patchMediaIndex(restore.accountEmail, [], restore.items)
+                .catch((error) => console.warn("[GPD] Could not update media index:", error))
+            }
             if (!result.success) {
               // Optimistic restore already happened in UI; show a non-blocking alert
               console.error("GPD: Restore failed:", result.error)
@@ -383,6 +459,8 @@ export default function App() {
           break
         case "gptkProgress": {
           const progress = message as GptkProgressMessage
+          if (progress.command === undefined &&
+              (progress.requestId !== currentScanRequestIdRef.current || fetchContextRef.current?.completing)) break
           // Any fetch progress means the GP tab is still alive — reset the
           // silence timer.
           if (
@@ -418,7 +496,7 @@ export default function App() {
   const runDuplicateDetection = useCallback(
     async (items: GpdMediaItem[], signal: AbortSignal) => {
       const logger = scanLoggerRef.current
-      await logger.start(items.length)
+      const requestId = currentScanRequestIdRef.current
       try {
         const onProgressCallback = (progress: DetectionProgress) => {
           dispatch({
@@ -443,7 +521,8 @@ export default function App() {
                 (settingsRef.current.smartWindowSec ?? 1) * 1000,
                 onProgressCallback,
                 signal,
-                logger
+                logger,
+                settingsRef.current.thumbnailConcurrency ?? 10
               )
             : await (async () => {
                 const result = await fullDetectDuplicates(
@@ -451,12 +530,14 @@ export default function App() {
                   settingsRef.current.similarityThreshold,
                   onProgressCallback,
                   signal,
-                  logger
+                  logger,
+                  settingsRef.current.thumbnailConcurrency ?? 10
                 )
                 return result.groups
               })()
 
         await logger.finalize("complete", { groupsFound: groups.length })
+        if (requestId !== currentScanRequestIdRef.current || signal.aborted) return
         currentScanRequestIdRef.current = null
 
         const mediaItemMap: Record<string, GpdMediaItem> = {}
@@ -473,6 +554,7 @@ export default function App() {
         // if the user switched accounts since the last health check.
         sendToServiceWorker({ app: APP_ID, action: "healthCheck" })
       } catch (error) {
+        if (requestId !== currentScanRequestIdRef.current) return
         currentScanRequestIdRef.current = null
         if (error instanceof DOMException && error.name === "AbortError") {
           await logger.finalize("cancelled")
@@ -647,38 +729,42 @@ export default function App() {
     dispatch({ type: "SCAN_STARTED", requestId, hasGptk, accountEmail })
 
     console.log(
-      `[GPD] starting scan: mode=${settings.scanMode}, threshold=${settings.similarityThreshold}`
+      `[GPD] starting scan: mode=${settings.scanMode}, threshold=${settings.similarityThreshold}, thumbnailConcurrency=${settings.thumbnailConcurrency ?? 10}`
     )
 
-    // Load cached media items for incremental fetch. On a repeat scan we only
-    // fetch items newer than the most-recently-seen upload timestamp.
+    const startedAt = performance.now()
+    const logger = new ScanLogger()
+    scanLoggerRef.current = logger
+    const context = {
+      requestId, accountEmail, startedAt, completing: false, logger,
+      metrics: { mode: "full", cacheLoadMs: 0, cachedItems: 0, totalFetchMs: 0 } as MediaFetchLog
+    }
+    fetchContextRef.current = context
+    mediaStreamRef.current = null
+    await logger.start(0)
+    if (requestId !== currentScanRequestIdRef.current) return
     cachedMediaItemsRef.current = null
     let sinceTimestamp: number | undefined
-    try {
-      const stored = (await chrome.storage.local.get(
-        "scanResults"
-      )) as Partial<StoredState>
-      const prev = stored.scanResults
-      if (
-        prev?.mediaItems &&
-        Object.keys(prev.mediaItems).length > 0 &&
-        areScanResultsValid(prev, { accountEmail })
-      ) {
-        cachedMediaItemsRef.current = prev.mediaItems
-        // Compute watermark if not stored (migration: first run after this deploy)
-        sinceTimestamp =
-          prev.newestCreationTimestamp ??
-          Object.values(prev.mediaItems).reduce(
-            (max, item) => Math.max(max, item.creationTimestamp ?? 0),
-            0
-          )
-        console.log(
-          `[GPD] media items cache: ${Object.keys(prev.mediaItems).length} items, fetching since ${new Date(sinceTimestamp).toISOString()}`
-        )
+    const loadStart = performance.now()
+    if (settings.mediaRefreshMode !== "full") {
+      try {
+        const index = await loadMediaIndex(accountEmail)
+        if (requestId !== currentScanRequestIdRef.current) return
+        if (index && index.newestCreationTimestamp > 0) {
+          cachedMediaItemsRef.current = index.mediaItems
+          sinceTimestamp = index.newestCreationTimestamp
+          context.metrics.cachedItems = Object.keys(index.mediaItems).length
+          context.metrics.mode = "incremental"
+        }
+      } catch (error) {
+        console.warn("[GPD] Media index unavailable; fetching the full library:", error)
       }
-    } catch {
-      // Cache unavailable — do full fetch
     }
+    context.metrics.cacheLoadMs = performance.now() - loadStart
+    context.metrics.totalFetchMs = performance.now() - startedAt
+    await logger.recordMediaFetch(context.metrics)
+    if (requestId !== currentScanRequestIdRef.current) return
+    console.log(`[GPD] media index: ${context.metrics.cachedItems} cached, ${context.metrics.mode} refresh`)
 
     armFetchWatchdog()
     sendToServiceWorker({
@@ -688,7 +774,9 @@ export default function App() {
       requestId,
       args: {
         dateRange: settings.dateRange,
-        sinceTimestamp
+        sinceTimestamp,
+        accountEmail,
+        streamResults: true
       }
     })
   }, [settings, armFetchWatchdog])
@@ -729,6 +817,7 @@ export default function App() {
       totalItems: state.totalItems
     }
     pendingDedupKeysRef.current = dedupKeys
+    pendingTrashAccountRef.current = { requestId, accountEmail: state.accountEmail }
 
     dispatch({
       type: "TRASH_STARTED",
@@ -752,6 +841,15 @@ export default function App() {
     clearFetchWatchdog()
     currentScanRequestIdRef.current = null
     resultChunksRef.current = {}
+    mediaStreamRef.current = null
+    cachedMediaItemsRef.current = null
+    const context = fetchContextRef.current
+    if (context) {
+      const log = !context.completing
+        ? context.logger.recordMediaFetch({ ...context.metrics, totalFetchMs: performance.now() - context.startedAt })
+        : Promise.resolve()
+      void log.then(() => context.logger.finalize("cancelled"))
+    }
     dispatch({ type: "SCAN_CANCELLED" })
   }, [clearFetchWatchdog])
 
@@ -773,12 +871,19 @@ export default function App() {
       groups: undoData.snapshot.groups,
       totalItems: undoData.snapshot.totalItems
     })
-    // Call GPTK to restore from trash
+    // Only a successful restore updates the independent library index.
+    const requestId = generateRequestId()
+    const current = stateRef.current
+    const restoredDedupKeys = new Set(undoData.dedupKeys)
+    pendingRestoresRef.current.set(requestId, {
+      accountEmail: "accountEmail" in current ? current.accountEmail : undefined,
+      items: Object.values(undoData.snapshot.mediaItems).filter((item) => restoredDedupKeys.has(item.dedupKey))
+    })
     sendToServiceWorker({
       app: APP_ID,
       action: "gptkCommand",
       command: "restoreItems",
-      requestId: generateRequestId(),
+      requestId,
       args: { dedupKeys: undoData.dedupKeys }
     })
     setUndoData(null)
@@ -880,6 +985,11 @@ export default function App() {
             phase={state.phase}
             itemsProcessed={state.itemsProcessed}
             totalEstimate={state.totalEstimate}
+            countLabel={
+              state.phase === "detecting_duplicates" && settings.scanMode === "full"
+                ? "checks completed"
+                : undefined
+            }
             message={state.message}
             onCancel={handleCancelScan}
           />

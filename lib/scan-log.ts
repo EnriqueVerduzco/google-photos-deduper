@@ -1,3 +1,5 @@
+import type { MediaFetchMetrics } from "./types"
+
 // Scan performance and error log — persisted incrementally to chrome.storage.local.
 //
 // chrome.storage.local is backed by LevelDB on disk and survives page reloads,
@@ -25,9 +27,43 @@ export interface StableEstimate {
 }
 
 export interface PhaseTimings {
+  fetchMediaItemsMs?: number
   fetchThumbnailsMs?: number
   computeEmbeddingsMs?: number
   communityDetectionMs?: number
+}
+
+export interface ThumbnailDownloadMetrics {
+  /** Configured maximum number of simultaneous requests. */
+  concurrency: number
+  /** Total network attempts, including retries. */
+  attempts: number
+  /** Items downloaded successfully. */
+  successes: number
+  /** Items that still failed after retry handling. */
+  failures: number
+  /** Non-2xx HTTP responses observed across all attempts. */
+  httpStatusFailures: number
+  /** HTTP 429 responses, tracked separately to make throttling visible. */
+  throttledResponses: number
+  /** Per-attempt timeouts observed across all attempts. */
+  timeouts: number
+  /** Follow-up attempts made after a transient failure. */
+  retries: number
+  elapsedMs: number
+  /** Successful thumbnail downloads divided by elapsed wall-clock seconds. */
+  effectivePerSecond: number
+}
+
+export interface MediaFetchLog extends Partial<MediaFetchMetrics> {
+  mode: "incremental" | "full"
+  cacheLoadMs: number
+  cachedItems: number
+  mergedItems?: number
+  mergeMs?: number
+  cacheSaveMs?: number
+  finalTransferMs?: number
+  totalFetchMs: number
 }
 
 export type ScanStatus = "complete" | "cancelled" | "error" | "killed_by_reload"
@@ -41,6 +77,8 @@ export interface ScanLogEntry {
   /** Candidates whose embedding was already in the IndexedDB cache. */
   cacheHits: number
   phaseTimings: PhaseTimings
+  mediaFetch?: MediaFetchLog
+  thumbnailDownloads?: ThumbnailDownloadMetrics
   /** Wall-clock ms from scan start to termination (success or otherwise). */
   totalMs: number
   groupsFound?: number
@@ -62,6 +100,8 @@ interface ActiveScanEntry {
   candidates: number
   cacheHits: number
   phaseTimings: PhaseTimings
+  mediaFetch?: MediaFetchLog
+  thumbnailDownloads?: ThumbnailDownloadMetrics
   stableEstimates: StableEstimate[]
 }
 
@@ -74,7 +114,7 @@ interface ActiveScanEntry {
  *
  * Lifecycle:
  *   scanLogger.recoverStale()        // on app mount — salvage any reload victim
- *   await scanLogger.start(n)        // before detectDuplicates
+ *   await scanLogger.start(0)        // before library metadata fetching
  *   // (detectDuplicates calls updateInfo / phaseComplete / recordStableEstimate)
  *   await scanLogger.finalize(...)   // on every exit path
  */
@@ -100,6 +140,8 @@ export class ScanLogger {
         candidates: stale.candidates,
         cacheHits: stale.cacheHits,
         phaseTimings: stale.phaseTimings,
+        thumbnailDownloads: stale.thumbnailDownloads,
+        mediaFetch: stale.mediaFetch,
         totalMs: Date.now() - stale.startedAt,
         stableEstimates: stale.stableEstimates
       })
@@ -108,10 +150,10 @@ export class ScanLogger {
     }
   }
 
-  /** Start a new active entry. Call before detectDuplicates. */
-  async start(totalItems: number): Promise<void> {
+  /** Start a new active entry before fetching library metadata. */
+  async start(totalItems: number, startedAt = Date.now()): Promise<void> {
     this.active = {
-      startedAt: Date.now(),
+      startedAt,
       totalItems,
       candidates: 0,
       cacheHits: 0,
@@ -143,6 +185,26 @@ export class ScanLogger {
       .catch(() => {})
   }
 
+  /** Step 1 timing is independent of thumbnail downloading and detection. */
+  async recordMediaFetch(metrics: MediaFetchLog, totalItems?: number): Promise<void> {
+    if (!this.active) return
+    this.active.mediaFetch = metrics
+    this.active.phaseTimings.fetchMediaItemsMs = metrics.totalFetchMs
+    if (totalItems !== undefined) this.active.totalItems = totalItems
+    await chrome.storage.local.set({ [ACTIVE_KEY]: this.active }).catch(() => {})
+  }
+
+  /** Persist the completed thumbnail phase's reliability and throughput data. */
+  async recordThumbnailDownloads(
+    metrics: ThumbnailDownloadMetrics
+  ): Promise<void> {
+    if (!this.active) return
+    this.active.thumbnailDownloads = metrics
+    await chrome.storage.local
+      .set({ [ACTIVE_KEY]: this.active })
+      .catch(() => {})
+  }
+
   /** Called by StabilityTracker when a stable estimate is reached for a phase. */
   recordStableEstimate(est: StableEstimate): void {
     if (!this.active) return
@@ -165,6 +227,8 @@ export class ScanLogger {
       candidates: active.candidates,
       cacheHits: active.cacheHits,
       phaseTimings: active.phaseTimings,
+      thumbnailDownloads: active.thumbnailDownloads,
+      mediaFetch: active.mediaFetch,
       totalMs: Date.now() - active.startedAt,
       stableEstimates: active.stableEstimates,
       ...extra
