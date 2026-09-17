@@ -1,6 +1,6 @@
 # Google Photos Deduper
 
-[![CI Badge](https://github.com/mtalcott/google-photos-deduper/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mtalcott/google-photos-deduper/actions/workflows/ci.yml?query=branch%3Amain)
+[![CI Badge](https://github.com/EnriqueVerduzco/google-photos-deduper/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/EnriqueVerduzco/google-photos-deduper/actions/workflows/ci.yml?query=branch%3Amain)
 
 A Chrome extension that finds and removes duplicate photos from your Google Photos library.
 
@@ -35,7 +35,7 @@ No OAuth setup. No Google Cloud project. No data leaves your browser.
 **Prerequisites:** Google Chrome, Node.js 22
 
 ```bash
-git clone https://github.com/mtalcott/google-photos-deduper.git
+git clone https://github.com/EnriqueVerduzco/google-photos-deduper.git
 cd google-photos-deduper
 git submodule update --init --recursive
 npm install
@@ -86,9 +86,9 @@ Google deprecated the Photos Library API's write access in 2025, and duplicate d
 
 ## Support
 
-Found a bug or have a feature request? [Open an issue](https://github.com/mtalcott/google-photos-deduper/issues/new/choose).
+Found a bug or have a feature request? [Open an issue](https://github.com/EnriqueVerduzco/google-photos-deduper/issues/new/choose).
 
-Have questions? [Post on the discussions page](https://github.com/mtalcott/google-photos-deduper/discussions).
+Have questions? [Post on the discussions page](https://github.com/EnriqueVerduzco/google-photos-deduper/discussions).
 
 ## Say Thanks
 
