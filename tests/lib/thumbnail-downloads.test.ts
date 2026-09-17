@@ -37,7 +37,7 @@ afterEach(() => {
 })
 
 describe("fetchThumbnails", () => {
-  it("uses concurrency 10 by default", async () => {
+  it("uses fixed concurrency 16", async () => {
     let inFlight = 0
     let maxInFlight = 0
     vi.stubGlobal(
@@ -51,37 +51,11 @@ describe("fetchThumbnails", () => {
       })
     )
 
-    const result = await fetchThumbnails(makeItems(11), new Set())
+    const result = await fetchThumbnails(makeItems(17), new Set())
 
-    expect(result.metrics.concurrency).toBe(10)
-    expect(maxInFlight).toBe(10)
-    expect(result.metrics.successes).toBe(11)
-  })
-
-  it("honors a selected concurrency", async () => {
-    let inFlight = 0
-    let maxInFlight = 0
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => {
-        inFlight++
-        maxInFlight = Math.max(maxInFlight, inFlight)
-        await new Promise((resolve) => setTimeout(resolve, 5))
-        inFlight--
-        return okResponse()
-      })
-    )
-
-    const result = await fetchThumbnails(
-      makeItems(13),
-      new Set(),
-      undefined,
-      undefined,
-      12
-    )
-
-    expect(result.metrics.concurrency).toBe(12)
-    expect(maxInFlight).toBe(12)
+    expect(result.metrics.concurrency).toBe(16)
+    expect(maxInFlight).toBe(16)
+    expect(result.metrics.successes).toBe(17)
   })
 
   it("retries transient failures and records exhausted and non-retryable failures", async () => {
@@ -180,7 +154,6 @@ describe("fetchThumbnails", () => {
       new Set(),
       undefined,
       controller.signal,
-      16,
       logger
     )
     controller.abort()

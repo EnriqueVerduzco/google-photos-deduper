@@ -104,7 +104,7 @@ export function ScanConfig({
                 <ToggleButton value="full">Refresh entire library</ToggleButton>
               </ToggleButtonGroup>
               <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
-                Recent uploads reuses saved library details. Refresh the entire library
+                Cache reuses saved library details. Refresh the entire library
                 to include older edits, deletions, and restored items.
               </Typography>
             </Box>
@@ -156,41 +156,13 @@ export function ScanConfig({
               </Box>
             )}
 
-            <Box sx={{ mb: 3 }}>
-              <Typography variant="body2" fontWeight={500} sx={{ mb: 1 }}>
-                Concurrent Thumbnail Downloads:
-              </Typography>
-              <ToggleButtonGroup
-                value={settings.thumbnailConcurrency ?? 10}
-                exclusive
-                size="small"
-                fullWidth
-                aria-label="Thumbnail download concurrency"
-                onChange={(_, value) => {
-                  if (value !== null) {
-                    onSettingsChange({ thumbnailConcurrency: value })
-                  }
-                }}>
-                <ToggleButton value={10}>10</ToggleButton>
-                <ToggleButton value={12}>12</ToggleButton>
-                <ToggleButton value={16}>16</ToggleButton>
-              </ToggleButtonGroup>
-              <Typography
-                variant="caption"
-                color="text.secondary"
-                sx={{ display: "block", mt: 0.5 }}>
-                Concurrent requests. Start at 10; higher values may trigger
-                throttling.
-              </Typography>
-            </Box>
-
             <Box>
               <Typography variant="body2" fontWeight={500} sx={{ mb: 1 }}>
                 Similarity Threshold:{" "}
                 <strong>{settings.similarityThreshold}</strong>
               </Typography>
               <Slider
-                min={0.9}
+                min={0.95}
                 max={1.0}
                 step={0.01}
                 value={settings.similarityThreshold}

@@ -521,8 +521,7 @@ export default function App() {
                 (settingsRef.current.smartWindowSec ?? 1) * 1000,
                 onProgressCallback,
                 signal,
-                logger,
-                settingsRef.current.thumbnailConcurrency ?? 10
+                logger
               )
             : await (async () => {
                 const result = await fullDetectDuplicates(
@@ -530,8 +529,7 @@ export default function App() {
                   settingsRef.current.similarityThreshold,
                   onProgressCallback,
                   signal,
-                  logger,
-                  settingsRef.current.thumbnailConcurrency ?? 10
+                  logger
                 )
                 return result.groups
               })()
@@ -729,7 +727,7 @@ export default function App() {
     dispatch({ type: "SCAN_STARTED", requestId, hasGptk, accountEmail })
 
     console.log(
-      `[GPD] starting scan: mode=${settings.scanMode}, threshold=${settings.similarityThreshold}, thumbnailConcurrency=${settings.thumbnailConcurrency ?? 10}`
+      `[GPD] starting scan: mode=${settings.scanMode}, threshold=${settings.similarityThreshold}, thumbnailConcurrency=16`
     )
 
     const startedAt = performance.now()

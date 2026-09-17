@@ -184,7 +184,6 @@ export async function fullDetectDuplicates(
   onProgress?: ProgressCallback,
   signal?: AbortSignal,
   logger?: ScanLogger,
-  thumbnailConcurrency = 10,
 ): Promise<{ groups: DuplicateGroup[]; timing: ScanTiming }> {
   const scanStart = performance.now();
 
@@ -253,7 +252,6 @@ export async function fullDetectDuplicates(
     cachedKeySet,
     trackedProgress,
     signal,
-    thumbnailConcurrency,
     logger,
   );
   const fetchThumbnailsMs = Math.round(performance.now() - t1);
@@ -497,7 +495,6 @@ export async function smartDetectDuplicates(
   onProgress?: ProgressCallback,
   signal?: AbortSignal,
   logger?: ScanLogger,
-  thumbnailConcurrency = 10,
 ): Promise<DuplicateGroup[]> {
   const scanStart = performance.now();
 
@@ -560,7 +557,6 @@ export async function smartDetectDuplicates(
     cachedKeySet,
     trackedProgress,
     signal,
-    thumbnailConcurrency,
     logger,
   );
   const fetchThumbnailsMs = Math.round(performance.now() - t1);
@@ -641,17 +637,10 @@ export async function smartDetectDuplicates(
 // Step 1: Fetch thumbnails
 // ============================================================
 
-const DEFAULT_THUMBNAIL_CONCURRENCY = 10;
-const ALLOWED_THUMBNAIL_CONCURRENCY = new Set([10, 12, 16]);
+const DEFAULT_THUMBNAIL_CONCURRENCY = 16;
 const THUMBNAIL_FETCH_TIMEOUT_MS = 8000;
 const THUMBNAIL_MAX_RETRIES = 2;
 const THUMBNAIL_RETRY_BASE_MS = 100;
-
-function normalizeThumbnailConcurrency(value: number): number {
-  return ALLOWED_THUMBNAIL_CONCURRENCY.has(value)
-    ? value
-    : DEFAULT_THUMBNAIL_CONCURRENCY;
-}
 
 function waitForRetry(ms: number, signal?: AbortSignal): Promise<void> {
   signal?.throwIfAborted();
@@ -683,10 +672,9 @@ export async function fetchThumbnails(
   cachedKeySet: Set<string>,
   onProgress?: ProgressCallback,
   signal?: AbortSignal,
-  requestedConcurrency = DEFAULT_THUMBNAIL_CONCURRENCY,
   logger?: ScanLogger,
 ): Promise<FetchThumbnailsResult> {
-  const concurrency = normalizeThumbnailConcurrency(requestedConcurrency);
+  const concurrency = DEFAULT_THUMBNAIL_CONCURRENCY;
   const blobs: (Blob | null)[] = new Array(items.length).fill(null);
   let completed = 0;
   const startedAt = performance.now();

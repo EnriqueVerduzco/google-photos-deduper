@@ -257,12 +257,6 @@ export interface ScanSettings {
   similarityThreshold: number;
   scanMode: ScanMode;
   /**
-   * Maximum number of thumbnails downloaded at once. Optional so settings
-   * saved by older extension versions continue to load; callers fall back to
-   * the legacy value of 10.
-   */
-  thumbnailConcurrency?: 10 | 12 | 16;
-  /**
    * Smart-mode timestamp bucket window in seconds. Items with `taken` dates
    * within this window are compared against each other. Default is 1 second
    * (matches the legacy hardcoded value). Widen to catch re-saved videos /
@@ -280,5 +274,4 @@ export const DEFAULT_SETTINGS: ScanSettings = {
   similarityThreshold: 0.99,
   scanMode: "smart",
   smartWindowSec: 1,
-  thumbnailConcurrency: 10,
 };
