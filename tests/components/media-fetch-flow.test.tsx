@@ -87,7 +87,7 @@ beforeEach(() => {
   listeners = new Set()
   sent = []
   vi.clearAllMocks()
-  detection.smart.mockResolvedValue([])
+  detection.smart.mockResolvedValue({ groups: [], bucketsSplit: 0 })
   detection.full.mockResolvedValue({ groups: [], timing: {} })
   vi.stubGlobal("chrome", {
     storage: { local: storage },
@@ -161,10 +161,10 @@ const end = (requestId: string, totalChunks = 1) => ({
   }
 })
 
-it("saves the index before detection, retains it after zero matches, and uses it on the next scan", async () => {
+it("saves the index before detection, retains it after zero matches, and refreshes metadata on the next scan", async () => {
   detection.smart.mockImplementation(async () => {
     expect(store[mediaIndexKey(account)!].mediaItems.a).toEqual(item("a"))
-    return []
+    return { groups: [], bucketsSplit: 0 }
   })
   await mount()
   const first = await start()
@@ -186,13 +186,13 @@ it("saves the index before detection, retains it after zero matches, and uses it
   fireEvent.click(screen.getByRole("button", { name: "Back to Scan" }))
   await screen.findByRole("button", { name: "Start local test scan" })
   const second = await start()
-  expect(second.args).toMatchObject({ sinceTimestamp: 100 })
+  expect((second.args as any).sinceTimestamp).toBeUndefined()
   fireEvent.click(
     screen.getByRole("button", { name: "Cancel local test scan" })
   )
 })
 
-it("commits only after every distinct page and merges in source order", async () => {
+it("commits only after every distinct page and replaces stale cached rows in source order", async () => {
   store[mediaIndexKey(account)!] = createMediaIndex(account, [
     item("cached", 50)
   ])
@@ -209,7 +209,7 @@ it("commits only after every distinct page and merges in source order", async ()
   await waitFor(() => expect(detection.smart).toHaveBeenCalledTimes(1))
   expect(
     detection.smart.mock.calls[0][0].map((row: GpdMediaItem) => row.mediaKey)
-  ).toEqual(["first", "second", "cached"])
+  ).toEqual(["first", "second"])
 })
 
 it("keeps the previous index when a partial refresh fails", async () => {
@@ -270,12 +270,12 @@ it("retains a completed fetch when detection is cancelled", async () => {
   ])
 })
 
-it("full refresh bypasses the watermark and replaces the index after success", async () => {
+it("refreshes the full library even with a legacy Use Cache preference", async () => {
+  store.settings = { mediaRefreshMode: "incremental", scanMode: "smart", similarityThreshold: 0.99 }
   store[mediaIndexKey(account)!] = createMediaIndex(account, [
     item("deleted-externally")
   ])
   await mount()
-  fireEvent.click(screen.getByRole("button", { name: "Full refresh" }))
   const command = await start()
   expect((command.args as any).sinceTimestamp).toBeUndefined()
   await deliver(page(command.requestId, [item("current")]))
@@ -304,34 +304,31 @@ it("rejects a completed stream for a different account without replacing the ind
   expect(detection.smart).not.toHaveBeenCalled()
 })
 
-it("does not send a fetch command if cancelled while loading the index", async () => {
-  let resolveCache!: (value: unknown) => void
-  const original = storage.get.getMockImplementation()!
-  storage.get.mockImplementation((keys, callback) => {
-    if (keys === mediaIndexKey(account))
-      return new Promise((resolve) => {
-        resolveCache = resolve
-      }) as any
-    return original(keys, callback)
+it("does not send a fetch command if cancelled while starting the scan log", async () => {
+  let finishLog!: () => void
+  const original = storage.set.getMockImplementation()!
+  storage.set.mockImplementation(async (values) => {
+    if (values.scanLogActive) await new Promise<void>((resolve) => { finishLog = resolve })
+    await original(values)
   })
   try {
     await mount()
-    fireEvent.click(
-      screen.getByRole("button", { name: "Start local test scan" })
-    )
-    await waitFor(() => expect(resolveCache).toBeDefined())
-    fireEvent.click(
-      screen.getByRole("button", { name: "Cancel local test scan" })
-    )
-    await act(async () =>
-      resolveCache({
-        [mediaIndexKey(account)!]: createMediaIndex(account, [item("old")])
-      })
-    )
-    expect(sent.some((message) => message.command === "getAllMediaItems")).toBe(
-      false
-    )
+    fireEvent.click(screen.getByRole("button", { name: "Start local test scan" }))
+    await waitFor(() => expect(finishLog).toBeDefined())
+    fireEvent.click(screen.getByRole("button", { name: "Cancel local test scan" }))
+    await act(async () => finishLog())
+    expect(sent.some((message) => message.command === "getAllMediaItems")).toBe(false)
   } finally {
-    storage.get.mockImplementation(original)
+    storage.set.mockImplementation(original)
   }
+})
+
+it("shows the split-bucket notice even when no duplicates were found", async () => {
+  detection.smart.mockResolvedValue({ groups: [], bucketsSplit: 1 })
+  await mount()
+  const command = await start()
+  await deliver(page(command.requestId, [item("a")]))
+  await deliver(end(command.requestId))
+  await screen.findByText("No duplicates found in your library.")
+  expect(screen.getByRole("alert")).toHaveTextContent("Duplicates spanning a split may be missed")
 })

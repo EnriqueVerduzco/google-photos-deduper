@@ -35,7 +35,8 @@ import { selectDefaultKeep } from "../lib/duplicate-detector"
 import { ScanLogger } from "../lib/scan-log"
 import theme from "../lib/theme"
 import { APP_ID, DEFAULT_SETTINGS } from "../lib/types"
-import { loadMediaIndex, mergeMediaItems, normalizeAccount, patchMediaIndex, saveMediaIndex } from "../lib/media-index"
+import { mergeMediaItems, normalizeAccount, patchMediaIndex, saveMediaIndex } from "../lib/media-index"
+import { countFullyTrashedGroups, toggleWholeGroupTrashed } from "../lib/kept-overrides"
 import { MediaStream } from "../lib/media-stream"
 import type { MediaFetchLog } from "../lib/scan-log"
 import type {
@@ -63,10 +64,9 @@ import type {
 const HEALTH_CHECK_MAX_ATTEMPTS = 5
 
 // How long the fetch phase may go without any sign of life before the app
-// gives up. The page script times each pagination request out after 60s, so
-// silence well past that means the result was lost in transit rather than
-// merely slow — most often a message that never arrived (#147). Without this
-// the app waits forever and the scan looks frozen mid-count.
+// gives up. The page script allows 60s per network attempt and reports retry
+// waits (up to 61s) as progress. Silence well past either interval means the
+// result was lost in transit rather than merely slow (#147).
 const FETCH_WATCHDOG_MS = 150_000
 
 function generateRequestId(): string {
@@ -103,6 +103,7 @@ export default function App() {
   const [trashConfirm, setTrashConfirm] = useState<{
     dedupKeys: string[]
     mediaKeysToTrash: string[]
+    fullyTrashedGroups: number
   } | null>(null)
 
   // Undo trash state: stored after a successful trash operation
@@ -130,9 +131,6 @@ export default function App() {
 
   // Persisted scan performance logger — survives page reloads via chrome.storage.local
   const scanLoggerRef = useRef(new ScanLogger())
-
-  // Cached media items from previous scan, used to merge with incremental fetch
-  const cachedMediaItemsRef = useRef<Record<string, GpdMediaItem> | null>(null)
 
   const mediaStreamRef = useRef<MediaStream | null>(null)
   const fetchContextRef = useRef<{
@@ -259,7 +257,6 @@ export default function App() {
       currentScanRequestIdRef.current = null
       mediaStreamRef.current = null
       resultChunksRef.current = {}
-      cachedMediaItemsRef.current = null
       scanAbortRef.current?.abort()
       if (context) {
         void context.logger.recordMediaFetch({
@@ -284,8 +281,9 @@ export default function App() {
         return
       }
       const mergeStart = performance.now()
-      const items = mergeMediaItems(fetched, cachedMediaItemsRef.current)
-      cachedMediaItemsRef.current = null
+      // A taken-date fetch is an authoritative snapshot. Keep our per-account
+      // index and page deduplication without reviving deleted cached items.
+      const items = mergeMediaItems(fetched)
       mediaStreamRef.current = null
       const mergeMs = performance.now() - mergeStart
       const saveStart = performance.now()
@@ -330,6 +328,7 @@ export default function App() {
           // the error.
           if (
             !msg.success &&
+            msg.reason !== "no_tab" &&
             healthCheckAttemptsRef.current < HEALTH_CHECK_MAX_ATTEMPTS - 1
           ) {
             healthCheckAttemptsRef.current++
@@ -513,7 +512,7 @@ export default function App() {
           })
         }
 
-        const groups =
+        const { groups, bucketsSplit } =
           settingsRef.current.scanMode === "smart"
             ? await smartDetectDuplicates(
                 items,
@@ -531,7 +530,7 @@ export default function App() {
                   signal,
                   logger
                 )
-                return result.groups
+                return { groups: result.groups, bucketsSplit: 0 }
               })()
 
         await logger.finalize("complete", { groupsFound: groups.length })
@@ -546,7 +545,8 @@ export default function App() {
         dispatch({
           type: "SCAN_COMPLETE",
           mediaItems: mediaItemMap,
-          groups
+          groups,
+          bucketsSplit
         })
         // Refresh account email after scan — the email in state may be stale
         // if the user switched accounts since the last health check.
@@ -602,6 +602,7 @@ export default function App() {
             mediaItems: result.scanResults.mediaItems,
             groups: result.scanResults.groups,
             totalItems: result.scanResults.totalItems,
+            bucketsSplit: result.scanResults.bucketsSplit,
             accountEmail: result.scanResults.accountEmail
           })
         }
@@ -614,7 +615,7 @@ export default function App() {
   const mediaItems = state.status === "results" ? state.mediaItems : null
 
   // Stable default kept sets (one per group, only changes when groups or mediaItems change).
-  // Uses smart keep selection: original quality > higher resolution > oldest upload date.
+  // Uses smart keep selection: favorite > original quality > resolution > oldest upload date.
   const defaultKeptSets = useMemo(() => {
     const m = new Map<string, Set<string>>()
     for (const g of groups) {
@@ -663,21 +664,22 @@ export default function App() {
     [defaultKeptSets]
   )
   const totalItems = state.status === "results" ? state.totalItems : 0
+  const bucketsSplit = state.status === "results" || state.status === "trashing"
+    ? state.bucketsSplit : 0
+  const handleTrashWholeGroup = useCallback((group: DuplicateGroup) => {
+    setKeptOverrides((prev) => toggleWholeGroupTrashed(prev, group.id))
+  }, [])
   const accountEmailForStorage = state.status === "results" ? state.accountEmail : undefined
   useEffect(() => {
     if (!mediaItems) return
     if (groups.length > 0) {
-      const newestCreationTimestamp = Object.values(mediaItems).reduce(
-        (max, item) => Math.max(max, item.creationTimestamp ?? 0),
-        0
-      )
       chrome.storage.local.set({
         scanResults: {
           mediaItems,
           groups,
           scanDate: Date.now(),
           totalItems,
-          newestCreationTimestamp,
+          bucketsSplit,
           accountEmail: accountEmailForStorage
         }
       })
@@ -685,7 +687,7 @@ export default function App() {
       // All duplicates removed — clear saved results so next open starts fresh
       chrome.storage.local.remove("scanResults")
     }
-  }, [groups, mediaItems, totalItems, accountEmailForStorage])
+  }, [groups, mediaItems, totalItems, bucketsSplit, accountEmailForStorage])
 
   // Persist selections when they change (only while results are showing)
   useEffect(() => {
@@ -741,24 +743,6 @@ export default function App() {
     mediaStreamRef.current = null
     await logger.start(0)
     if (requestId !== currentScanRequestIdRef.current) return
-    cachedMediaItemsRef.current = null
-    let sinceTimestamp: number | undefined
-    const loadStart = performance.now()
-    if (settings.mediaRefreshMode !== "full") {
-      try {
-        const index = await loadMediaIndex(accountEmail)
-        if (requestId !== currentScanRequestIdRef.current) return
-        if (index && index.newestCreationTimestamp > 0) {
-          cachedMediaItemsRef.current = index.mediaItems
-          sinceTimestamp = index.newestCreationTimestamp
-          context.metrics.cachedItems = Object.keys(index.mediaItems).length
-          context.metrics.mode = "incremental"
-        }
-      } catch (error) {
-        console.warn("[GPD] Media index unavailable; fetching the full library:", error)
-      }
-    }
-    context.metrics.cacheLoadMs = performance.now() - loadStart
     context.metrics.totalFetchMs = performance.now() - startedAt
     await logger.recordMediaFetch(context.metrics)
     if (requestId !== currentScanRequestIdRef.current) return
@@ -772,7 +756,6 @@ export default function App() {
       requestId,
       args: {
         dateRange: settings.dateRange,
-        sinceTimestamp,
         accountEmail,
         streamResults: true
       }
@@ -798,7 +781,8 @@ export default function App() {
     }
 
     if (dedupKeys.length === 0) return
-    setTrashConfirm({ dedupKeys, mediaKeysToTrash })
+    const fullyTrashedGroups = countFullyTrashedGroups(state.groups, selectedGroupIds, getKept)
+    setTrashConfirm({ dedupKeys, mediaKeysToTrash, fullyTrashedGroups })
   }, [state, selectedGroupIds, getKept])
 
   const handleTrashConfirmed = useCallback(() => {
@@ -840,7 +824,6 @@ export default function App() {
     currentScanRequestIdRef.current = null
     resultChunksRef.current = {}
     mediaStreamRef.current = null
-    cachedMediaItemsRef.current = null
     const context = fetchContextRef.current
     if (context) {
       const log = !context.completing
@@ -989,6 +972,7 @@ export default function App() {
                 : undefined
             }
             message={state.message}
+            oldestTakenAt={state.oldestTakenAt}
             onCancel={handleCancelScan}
           />
         )}
@@ -1005,6 +989,13 @@ export default function App() {
             <Typography variant="h6" color="text.secondary">
               No duplicates found in your library.
             </Typography>
+            {!!bucketsSplit && (
+              <Alert severity="info" sx={{ maxWidth: 480 }}>
+                {bucketsSplit} large time groups were split to keep the scan fast.
+                Duplicates spanning a split may be missed. Narrow the time window
+                to compare fewer photos at once.
+              </Alert>
+            )}
             <Button variant="contained" onClick={handleReset}>
               Back to Scan
             </Button>
@@ -1029,6 +1020,8 @@ export default function App() {
               onToggleGroup={handleToggleGroup}
               keptByGroupId={keptByGroupId}
               onToggleKept={handleToggleKept}
+              onTrashWholeGroup={handleTrashWholeGroup}
+              bucketsSplit={state.bucketsSplit}
             />
           </>
         )}
@@ -1063,6 +1056,13 @@ export default function App() {
             {trashConfirm?.dedupKeys.length !== 1 ? "s" : ""} to trash? You can
             restore them from the Google Photos trash.
           </DialogContentText>
+          {!!trashConfirm?.fullyTrashedGroups && (
+            <DialogContentText sx={{ mt: 2 }} color="error">
+              {trashConfirm.fullyTrashedGroups} group
+              {trashConfirm.fullyTrashedGroups !== 1 ? "s" : ""} will be removed
+              entirely — no copy will be kept.
+            </DialogContentText>
+          )}
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setTrashConfirm(null)}>Cancel</Button>

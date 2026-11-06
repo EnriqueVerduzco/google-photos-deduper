@@ -9,6 +9,11 @@
  * @vitest-environment happy-dom
  */
 import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from "vitest"
+import Api from "../../Google-Photos-Toolkit/src/api/api"
+
+vi.mock("../../Google-Photos-Toolkit/src/windowGlobalData", () => ({
+  windowGlobalData: { path: "/", at: "local-test" }
+}))
 
 // ============================================================
 // Globals the script expects at runtime
@@ -88,8 +93,8 @@ function findMediaItemsResult(
 }
 
 /** Wait for all queued microtasks / promise continuations to settle. */
-async function flush() {
-  await new Promise((r) => setTimeout(r, 0))
+async function flush(ms = 0) {
+  await vi.advanceTimersByTimeAsync(ms)
 }
 
 // ============================================================
@@ -97,6 +102,7 @@ async function flush() {
 // ============================================================
 
 beforeEach(() => {
+  vi.useFakeTimers()
   mockMoveItemsToTrash.mockReset()
   mockRestoreFromTrash.mockReset()
   mockMoveItemsToTrash.mockResolvedValue(undefined)
@@ -104,6 +110,8 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.useRealTimers()
+  vi.unstubAllGlobals()
   vi.restoreAllMocks()
 })
 
@@ -114,7 +122,7 @@ afterEach(() => {
 describe("getAllMediaItems — field mapping", () => {
   function setupGptkApi(items: unknown[], nextPageId: string | null = null) {
     ;(window as any).gptkApi = {
-      getItemsByUploadedDate: vi.fn().mockResolvedValue({ items, nextPageId }),
+      getItemsByTakenDate: vi.fn().mockResolvedValue({ items, nextPageId }),
     }
   }
 
@@ -241,7 +249,7 @@ describe("getAllMediaItems — result chunking", () => {
   function setupLibrary(total: number, pageSize = 5000) {
     let served = 0
     ;(window as any).gptkApi = {
-      getItemsByUploadedDate: vi.fn().mockImplementation(async () => {
+      getItemsByTakenDate: vi.fn().mockImplementation(async () => {
         const n = Math.min(pageSize, total - served)
         const items = Array.from({ length: n }, (_, i) => ({
           mediaKey: `mk${served + i}`,
@@ -299,7 +307,7 @@ describe("getAllMediaItems — result chunking", () => {
     setupLibrary(TOTAL)
     const { messages, restore } = collectMessages()
     sendCommand("getAllMediaItems", "req-chunk-large", {})
-    await flush()
+    await vi.runAllTimersAsync()
 
     const chunks = chunksFrom(messages)
     expect(chunks).toHaveLength(3)
@@ -324,7 +332,7 @@ describe("getAllMediaItems — result chunking", () => {
     setupLibrary(CHUNK_SIZE + 1)
     const { messages, restore } = collectMessages()
     sendCommand("getAllMediaItems", "req-chunk-id", {})
-    await flush()
+    await vi.runAllTimersAsync()
 
     const chunks = chunksFrom(messages)
     expect(chunks).toHaveLength(2)
@@ -528,7 +536,7 @@ describe("getAllMediaItems — page timeout", () => {
   it("surfaces a timeout error when a page fetch never resolves", async () => {
     ;(window as any).gptkApi = {
       // Never resolves — simulates Google's pagination endpoint hanging.
-      getItemsByUploadedDate: vi.fn(() => new Promise(() => {})),
+      getItemsByTakenDate: vi.fn(() => new Promise(() => {})),
     }
 
     const { messages, restore } = collectMessages()
@@ -547,7 +555,7 @@ describe("getAllMediaItems — page timeout", () => {
 
   it("does not error when the page resolves before the timeout fires", async () => {
     ;(window as any).gptkApi = {
-      getItemsByUploadedDate: vi
+      getItemsByTakenDate: vi
         .fn()
         .mockResolvedValue({ items: [], nextPageId: null }),
     }
@@ -562,36 +570,97 @@ describe("getAllMediaItems — page timeout", () => {
     expect(result?.success).toBe(true)
     restore()
   })
+
+  it("allows status-8 backoff past 60s and completes all pages without losing items", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    vi.spyOn(Math, "random").mockReturnValue(0.5)
+    const response = (key: string, next: string | null) => ({
+      ok: true,
+      text: async () => JSON.stringify([["wrb.fr", "lcxiM", JSON.stringify([
+        [[key, ["https://thumb", 100, 100], 100, `dedup-${key}`, null, 200, null, []]], next
+      ])]])
+    })
+    const throttled = { ok: true, text: async () =>
+      `)]}'\n\n104\n[["wrb.fr","lcxiM",null,null,null,[8],"generic"],["di",28]]\n25\n[["e",4,null,null,140]]` }
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(response("first", "next-page"))
+      .mockResolvedValueOnce(throttled)
+      .mockResolvedValueOnce(throttled)
+      .mockResolvedValueOnce(throttled)
+      .mockResolvedValueOnce(response("second", null))
+    vi.stubGlobal("fetch", fetch)
+    ;(window as any).gptkApi = new Api()
+
+    const { messages } = collectMessages()
+    sendCommand("getAllMediaItems", "long-backoff", { streamResults: true })
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(messages.some((m: any) => m.action === "gptkResult" && !m.success)).toBe(false)
+    expect(messages.some((m: any) => m.action === "gptkProgress" && m.message.includes("Waiting"))).toBe(true)
+    await vi.runAllTimersAsync()
+
+    const pages = messages.filter((m: any) => m.action === "gptkMediaPage") as any[]
+    expect(pages.flatMap((page) => page.data.map((item: any) => item.mediaKey))).toEqual(["first", "second"])
+    expect(messages.find((m: any) => m.action === "gptkMediaComplete")).toMatchObject({
+      metrics: { pages: 2, requestAttempts: 5, retries: 3, itemsEmitted: 2 }
+    })
+    const pageTokens = fetch.mock.calls.map(([, init]) => {
+      const request = JSON.parse(new URLSearchParams(init.body).get("f.req")!)
+      return JSON.parse(request[0][0][1])[0]
+    })
+    expect(pageTokens).toEqual([null, "next-page", "next-page", "next-page", "next-page"])
+    expect(fetch.mock.calls.every(([url]) => new URL(url).searchParams.get("rpcids") === "lcxiM")).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it("aborts a stalled network attempt when its timeout expires", async () => {
+    let signal: AbortSignal | undefined
+    const fetch = vi.fn((_url, init) => new Promise((_resolve, reject) => {
+      signal = init.signal
+      signal!.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true })
+    }))
+    vi.stubGlobal("fetch", fetch)
+    ;(window as any).gptkApi = new Api()
+    const { messages } = collectMessages()
+    sendCommand("getAllMediaItems", "abort-timeout", {})
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(signal?.aborted).toBe(true)
+    expect(messages.find((m: any) => m.action === "gptkResult")).toMatchObject({ success: false, error: expect.stringMatching(/timed out/) })
+    await vi.runAllTimersAsync()
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
 })
 
 // Only mocked API pages: no Google Photos or external requests.
-describe("getAllMediaItems — incremental streaming", () => {
+describe("getAllMediaItems — full-library streaming", () => {
   const media = (mediaKey: string, creationTimestamp: number) => ({ mediaKey, dedupKey: mediaKey, thumb: "local", timestamp: creationTimestamp, creationTimestamp })
   afterEach(() => { delete (window as any).gptkApi; delete (window as any).WIZ_global_data })
 
-  it("streams the first page before requesting the rest, including watermark ties across pages", async () => {
+  it("streams the first page before requesting the rest, including items older than a legacy watermark", async () => {
     let finishSecond!: (page: unknown) => void
     const second = new Promise((resolve) => { finishSecond = resolve })
     const api = vi.fn().mockResolvedValueOnce({ items: [media("new", 300), media("tie1", 200)], nextPageId: "second" })
       .mockReturnValueOnce(second)
-    ;(window as any).gptkApi = { getItemsByUploadedDate: api }
+    ;(window as any).gptkApi = { getItemsByTakenDate: api }
     const { messages } = collectMessages()
     sendCommand("getAllMediaItems", "stream-ties", { streamResults: true, sinceTimestamp: 200 })
     await flush()
     expect(messages.filter((m: any) => m.action === "gptkMediaPage")).toHaveLength(1)
     expect(messages.some((m: any) => m.action === "gptkMediaComplete")).toBe(false)
-    finishSecond({ items: [media("tie2", 200), media("old", 100)], nextPageId: "unused" })
-    await flush()
+    expect(api).toHaveBeenCalledTimes(1)
+    await flush(999)
+    expect(api).toHaveBeenCalledTimes(1)
+    finishSecond({ items: [media("tie2", 200), media("old", 100)], nextPageId: null })
+    await flush(1)
     const pages = messages.filter((m: any) => m.action === "gptkMediaPage") as any[]
-    expect(pages.flatMap((page) => page.data.map((item: any) => item.mediaKey))).toEqual(["new", "tie1", "tie2"])
+    expect(pages.flatMap((page) => page.data.map((item: any) => item.mediaKey))).toEqual(["new", "tie1", "tie2", "old"])
     expect(api).toHaveBeenCalledTimes(2)
     expect(messages.find((m: any) => m.action === "gptkMediaComplete")).toMatchObject({
-      totalChunks: 2, metrics: { pages: 2, pageItems: [2, 2], itemsReceived: 4, itemsEmitted: 3, reachedCache: true, retries: null }
+      totalChunks: 2, metrics: { pages: 2, pageItems: [2, 2], itemsReceived: 4, itemsEmitted: 4, reachedCache: false, retries: null }
     })
   })
 
   it("reports request attempts/retries when the toolkit supports observation", async () => {
-    ;(window as any).gptkApi = { getItemsByUploadedDate: vi.fn(async (_: unknown, __: unknown, onAttempt: (n: number) => void) => {
+    ;(window as any).gptkApi = { getItemsByTakenDate: vi.fn(async (_ts: unknown, _source: unknown, _page: unknown, _size: unknown, _parse: unknown, onAttempt: (n: number) => void) => {
       onAttempt(1); onAttempt(2)
       return { items: [media("a", 100)], nextPageId: null }
     }) }
@@ -605,7 +674,7 @@ describe("getAllMediaItems — incremental streaming", () => {
   })
 
   it("bounds oversized pages and finishes empty libraries without fake data chunks", async () => {
-    ;(window as any).gptkApi = { getItemsByUploadedDate: vi.fn().mockResolvedValueOnce({ items: Array.from({ length: 10001 }, (_, i) => media(String(i), 100)), nextPageId: null })
+    ;(window as any).gptkApi = { getItemsByTakenDate: vi.fn().mockResolvedValueOnce({ items: Array.from({ length: 10001 }, (_, i) => media(String(i), 100)), nextPageId: null })
       .mockResolvedValueOnce({ items: [], nextPageId: null }) }
     const { messages } = collectMessages()
     sendCommand("getAllMediaItems", "large-stream", { streamResults: true })
@@ -619,11 +688,11 @@ describe("getAllMediaItems — incremental streaming", () => {
   })
 
   it("fails a partial stream without emitting a completion marker", async () => {
-    ;(window as any).gptkApi = { getItemsByUploadedDate: vi.fn()
+    ;(window as any).gptkApi = { getItemsByTakenDate: vi.fn()
       .mockResolvedValueOnce({ items: [media("a", 100)], nextPageId: "broken" }).mockResolvedValueOnce(null) }
     const { messages } = collectMessages()
     sendCommand("getAllMediaItems", "partial-error", { streamResults: true })
-    await flush()
+    await flush(1000)
     expect(messages.some((m: any) => m.action === "gptkMediaPage")).toBe(true)
     expect(messages.some((m: any) => m.action === "gptkMediaComplete")).toBe(false)
     expect(messages.find((m: any) => m.action === "gptkResult")).toMatchObject({ success: false, mediaFetchMetrics: { pages: 1 } })
@@ -632,11 +701,192 @@ describe("getAllMediaItems — incremental streaming", () => {
   it("rejects a different or unidentified account before fetching with its cache watermark", async () => {
     ;(window as any).WIZ_global_data = { oPEP7c: "other@example.com" }
     const api = vi.fn()
-    ;(window as any).gptkApi = { getItemsByUploadedDate: api }
+    ;(window as any).gptkApi = { getItemsByTakenDate: api }
     const { messages } = collectMessages()
     sendCommand("getAllMediaItems", "account-mismatch", { streamResults: true, accountEmail: "a@example.com", sinceTimestamp: 200 })
     await flush()
     expect(api).not.toHaveBeenCalled()
     expect(messages.find((m: any) => m.action === "gptkResult")).toMatchObject({ success: false })
+  })
+})
+
+// ============================================================
+// getAllMediaItems — fetch position reporting
+//
+// Progress messages carry the oldest item seen so far so the UI can show how
+// far back through the library the fetch has walked.
+// ============================================================
+
+describe("getAllMediaItems — fetch position", () => {
+  function setupGptkApi(items: unknown[], nextPageId: string | null = null) {
+    ;(window as any).gptkApi = {
+      getItemsByTakenDate: vi.fn().mockResolvedValue({ items, nextPageId }),
+    }
+  }
+
+  afterEach(() => {
+    delete (window as any).gptkApi
+    window.history.pushState({}, "", "/")
+  })
+
+  const item = (mediaKey: string, timestamp: number, creationTimestamp: number) => ({
+    mediaKey,
+    dedupKey: `dk-${mediaKey}`,
+    thumb: `https://thumb/${mediaKey}`,
+    timestamp,
+    creationTimestamp,
+  })
+
+  async function progressFor(items: unknown[]) {
+    setupGptkApi(items)
+    const { messages, restore } = collectMessages()
+    sendCommand("getAllMediaItems", `req-pos-${Math.random()}`, {})
+    await flush()
+    const progress = messages.filter((m: any) => m.action === "gptkProgress")
+    restore()
+    return progress[progress.length - 1] as any
+  }
+
+  it("reports the oldest item's taken date and no upload date", async () => {
+    const p = await progressFor([
+      item("mk1", 1000, 5000),
+      item("mk2", 900, 4000), // last item = oldest, since pages are newest-first
+    ])
+    expect(p.oldestTakenAt).toBe(900)
+    expect(p.oldestUploadedAt).toBeUndefined()
+  })
+
+  // Real libraries contain items with no usable date; these must not be sent,
+  // or the UI would render them as 1 Jan 1970.
+  it("omits a zero taken date", async () => {
+    const p = await progressFor([item("mk1", 1000, 5000), item("mk2", 0, 4000)])
+    expect(p.oldestTakenAt).toBeUndefined()
+  })
+
+  it("omits a missing taken date", async () => {
+    const p = await progressFor([
+      item("mk1", 1000, 5000),
+      { ...item("mk2", 0, 4000), timestamp: undefined },
+    ])
+    expect(p.oldestTakenAt).toBeUndefined()
+  })
+
+  it("still reports the item count when no dates are usable", async () => {
+    const p = await progressFor([item("mk1", 0, 0)])
+    expect(p.itemsProcessed).toBe(1)
+    expect(p.oldestTakenAt).toBeUndefined()
+  })
+})
+
+// ============================================================
+// getAllMediaItems — favorite flag
+//
+// GPTK's libraryItemParse reads isFavorite from the protobuf extras map, where
+// it is absent rather than false for non-favorites. The projection normalises
+// it so keep-selection can test a plain boolean.
+// ============================================================
+
+describe("getAllMediaItems — favorite flag", () => {
+  function setupGptkApi(items: unknown[], nextPageId: string | null = null) {
+    ;(window as any).gptkApi = {
+      getItemsByTakenDate: vi.fn().mockResolvedValue({ items, nextPageId }),
+    }
+  }
+
+  afterEach(() => {
+    delete (window as any).gptkApi
+    window.history.pushState({}, "", "/")
+  })
+
+  async function firstItem(raw: Record<string, unknown>) {
+    setupGptkApi([
+      {
+        mediaKey: "mk1",
+        dedupKey: "dk1",
+        thumb: "https://thumb/1",
+        timestamp: 1,
+        creationTimestamp: 2,
+        ...raw,
+      },
+    ])
+    const { messages, restore } = collectMessages()
+    sendCommand("getAllMediaItems", `req-fav-${Math.random()}`, {})
+    await flush()
+    const result = findMediaItemsResult(messages)
+    restore()
+    return result?.data?.[0]
+  }
+
+  it("passes isFavorite=true through to the output item", async () => {
+    expect((await firstItem({ isFavorite: true })).isFavorite).toBe(true)
+  })
+
+  it("normalises an absent isFavorite to false", async () => {
+    expect((await firstItem({})).isFavorite).toBe(false)
+  })
+
+  it("normalises an explicit false to false", async () => {
+    expect((await firstItem({ isFavorite: false })).isFavorite).toBe(false)
+  })
+})
+
+// ============================================================
+// getAllMediaItems — listing source
+//
+// Google rejects the upload-date listing (EzkLib) for some accounts (#152), so
+// the scan pages through the taken-date timeline (lcxiM) instead.
+// ============================================================
+
+describe("getAllMediaItems — listing source", () => {
+  afterEach(() => {
+    delete (window as any).gptkApi
+  })
+
+  it("pages through getItemsByTakenDate and never calls the upload-date listing", async () => {
+    const takenDate = vi
+      .fn()
+      .mockResolvedValueOnce({
+        items: [{ mediaKey: "a", dedupKey: "da", timestamp: 2000, creationTimestamp: 10 }],
+        nextPageId: "p2",
+      })
+      .mockResolvedValueOnce({
+        items: [{ mediaKey: "b", dedupKey: "db", timestamp: 1000, creationTimestamp: 5 }],
+        nextPageId: null,
+      })
+    const uploaded = vi.fn()
+    ;(window as any).gptkApi = {
+      getItemsByTakenDate: takenDate,
+      getItemsByUploadedDate: uploaded,
+    }
+
+    const { messages, restore } = collectMessages()
+    sendCommand("getAllMediaItems", "req-src-1", {})
+    await flush(1000)
+
+    const result = findMediaItemsResult(messages)
+    expect(result?.success).toBe(true)
+    expect(result?.data.map((i: any) => i.mediaKey)).toEqual(["a", "b"])
+    expect(takenDate).toHaveBeenNthCalledWith(1, null, null, null, 500, true, expect.any(Function), expect.objectContaining({ signal: expect.any(AbortSignal), onRetry: expect.any(Function) }))
+    expect(takenDate).toHaveBeenNthCalledWith(2, null, null, "p2", 500, true, expect.any(Function), expect.objectContaining({ signal: expect.any(AbortSignal), onRetry: expect.any(Function) }))
+    expect(uploaded).not.toHaveBeenCalled()
+    restore()
+  })
+
+  // The old upload-date path stopped at a cache watermark. A full fetch must
+  // return every item, or items absent from the result would look deleted.
+  it("ignores a stale sinceTimestamp and returns the whole library", async () => {
+    ;(window as any).gptkApi = {
+      getItemsByTakenDate: vi.fn().mockResolvedValue({
+        items: [{ mediaKey: "old", dedupKey: "do", timestamp: 1, creationTimestamp: 1 }],
+        nextPageId: null,
+      }),
+    }
+
+    const { messages, restore } = collectMessages()
+    sendCommand("getAllMediaItems", "req-src-2", { sinceTimestamp: 999 })
+    await flush()
+
+    expect(findMediaItemsResult(messages)?.data.map((i: any) => i.mediaKey)).toEqual(["old"])
+    restore()
   })
 })

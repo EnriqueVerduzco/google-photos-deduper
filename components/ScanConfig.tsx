@@ -89,25 +89,10 @@ export function ScanConfig({
             </Typography>
           </AccordionSummary>
           <AccordionDetails>
-            <Box sx={{ mb: 3 }}>
-              <Typography variant="body2" fontWeight={500} sx={{ mb: 1 }}>
-                Library refresh
-              </Typography>
-              <ToggleButtonGroup
-                value={settings.mediaRefreshMode ?? "incremental"}
-                exclusive size="small" fullWidth
-                aria-label="Library refresh"
-                onChange={(_, value) => {
-                  if (value !== null) onSettingsChange({ mediaRefreshMode: value })
-                }}>
-                <ToggleButton value="incremental">Use Cache</ToggleButton>
-                <ToggleButton value="full">Refresh entire library</ToggleButton>
-              </ToggleButtonGroup>
-              <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
-                Cache reuses saved library details. Refresh the entire library
-                to include older edits, deletions, and restored items.
-              </Typography>
-            </Box>
+            <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 3 }}>
+              Each scan refreshes your library details. Cached thumbnails and
+              image comparisons are reused to speed up repeat scans.
+            </Typography>
 
             <Box sx={{ mb: 3 }}>
               <Typography variant="body2" fontWeight={500} sx={{ mb: 1 }}>

@@ -4377,8 +4377,7 @@
         }
         for (const [, members] of components)
           if (members.length >= 2) allGroups.push(members);
-        if (bi2 % 100 === 0)
-          self.postMessage({ type: "detectionProgress", current: bi2 + 1, total: buckets.length });
+        self.postMessage({ type: "detectionProgress", current: bi2 + 1, total: buckets.length });
       }
       self.postMessage({ type: "detectionResults", groups: allGroups });
     }

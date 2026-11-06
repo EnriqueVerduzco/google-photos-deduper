@@ -26,6 +26,9 @@ export type AppState =
       message: string
       requestId: string
       hasGptk: boolean
+      // How far back the fetch has reached, by taken date. Undefined until the
+      // first page.
+      oldestTakenAt?: number
       accountEmail?: string
     }
   | {
@@ -33,6 +36,10 @@ export type AppState =
       mediaItems: Record<string, GpdMediaItem>
       groups: DuplicateGroup[]
       totalItems: number
+      // How many timestamp buckets were split to bound comparison cost.
+      // > 0 means some duplicates spanning a split may not have been found.
+      // Optional: results persisted before this existed won't carry it.
+      bucketsSplit?: number
       accountEmail?: string
     }
   | {
@@ -42,6 +49,7 @@ export type AppState =
       totalItems: number
       totalToTrash: number
       trashedSoFar: number
+      bucketsSplit?: number
       accountEmail?: string
     }
 
@@ -54,6 +62,7 @@ export type AppAction =
       type: "SCAN_COMPLETE"
       mediaItems: Record<string, GpdMediaItem>
       groups: DuplicateGroup[]
+      bucketsSplit?: number
     }
   | { type: "SCAN_ERROR"; error: string }
   | { type: "SCAN_CANCELLED" }
@@ -72,6 +81,7 @@ export type AppAction =
       mediaItems: Record<string, GpdMediaItem>
       groups: DuplicateGroup[]
       totalItems: number
+      bucketsSplit?: number
       accountEmail?: string
     }
   | {
@@ -144,6 +154,11 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           : Math.max(state.itemsProcessed, action.payload.itemsProcessed),
         ...(action.totalItems !== undefined ? { totalEstimate: action.totalItems } : {}),
         message: action.payload.message || state.message,
+        // Spread only when present so a later message without dates does not
+        // blank out a position already on screen.
+        ...(action.payload.oldestTakenAt !== undefined
+          ? { oldestTakenAt: action.payload.oldestTakenAt }
+          : {}),
       }
 
     case "SCAN_MEDIA_FETCHED":
@@ -162,6 +177,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         mediaItems: action.mediaItems,
         groups: action.groups,
         totalItems: Object.keys(action.mediaItems).length,
+        bucketsSplit: action.bucketsSplit ?? 0,
         accountEmail: "accountEmail" in state ? state.accountEmail : undefined,
       }
 
@@ -180,6 +196,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         totalItems: action.totalItems,
         totalToTrash: action.totalToTrash,
         trashedSoFar: 0,
+        bucketsSplit: "bucketsSplit" in state ? state.bucketsSplit : 0,
         accountEmail: "accountEmail" in state ? state.accountEmail : undefined,
       }
 
@@ -207,6 +224,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         mediaItems: newMediaItems,
         groups: newGroups,
         totalItems: state.totalItems,
+        bucketsSplit: state.bucketsSplit,
         accountEmail: state.accountEmail,
       }
     }
@@ -220,6 +238,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         mediaItems: action.mediaItems,
         groups: action.groups,
         totalItems: action.totalItems,
+        bucketsSplit: action.bucketsSplit ?? 0,
         accountEmail: action.accountEmail,
       }
 
@@ -229,6 +248,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         mediaItems: action.mediaItems,
         groups: action.groups,
         totalItems: action.totalItems,
+        bucketsSplit: "bucketsSplit" in state ? state.bucketsSplit : 0,
         accountEmail: "accountEmail" in state ? state.accountEmail : undefined,
       }
 

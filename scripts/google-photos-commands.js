@@ -43,6 +43,10 @@ function postError(command, requestId, error, mediaFetchMetrics) {
 // forever. 10k items is ~4.6MB, leaving room for items far larger than average.
 const RESULT_CHUNK_SIZE = 10000
 
+// Leave a short gap between library pages to reduce bursts against Google's
+// private metadata API. Thumbnail download concurrency is independent of this.
+const LIBRARY_PAGE_DELAY_MS = 1000
+
 // Sends an array result as a sequence of gptkResultChunk messages.
 // Always sends at least one chunk so an empty result still completes.
 function postResultChunked(command, requestId, items) {
@@ -64,14 +68,15 @@ function postResultChunked(command, requestId, items) {
 }
 
 // command is optional; when provided, the app can route progress to the right handler.
-function postProgress(requestId, itemsProcessed, message, command) {
+function postProgress(requestId, itemsProcessed, message, command, position) {
   window.postMessage({
     app: GPD_APP_ID,
     action: "gptkProgress",
     requestId,
     itemsProcessed,
     message,
-    ...(command !== undefined ? { command } : {})
+    ...(command !== undefined ? { command } : {}),
+    ...position
   })
 }
 
@@ -99,8 +104,6 @@ async function getAllMediaItems(requestId, args) {
     return
   }
 
-  const sinceTimestamp = Number.isFinite(args?.sinceTimestamp) && args.sinceTimestamp > 0
-    ? args.sinceTimestamp : null
   const streaming = args?.streamResults === true
   const expectedAccount = args?.accountEmail?.trim().toLowerCase()
   const getAccount = () => (window.WIZ_global_data?.oPEP7c || "").trim().toLowerCase()
@@ -116,25 +119,32 @@ async function getAllMediaItems(requestId, args) {
     requestAttempts: null, retries: null, elapsedMs: 0, reachedCache: false
   }
 
-  // Per-page timeout. Google's pagination endpoint occasionally hangs without
-  // ever rejecting fetch(), which used to lock the UI on "Fetching media
-  // items" indefinitely. A timeout lets us surface a real error to the user.
+  // Each network attempt gets 60s. Retry backoff has its own allowance so a
+  // rate-limited page can recover without the old total-page timer cutting it off.
   const PAGE_TIMEOUT_MS = 60_000
 
-  function withTimeout(promise, ms, label) {
+  function withTimeout(startRequest, ms, label) {
     let timer
+    let resetTimeout
+    const controller = new AbortController()
     const timeout = new Promise((_, reject) => {
-      timer = setTimeout(
-        () =>
+      resetTimeout = (allowance = ms) => {
+        clearTimeout(timer)
+        timer = setTimeout(() => {
           reject(
             new Error(
-              `${label} timed out after ${Math.round(ms / 1000)}s. Google's API likely stalled — please re-scan.`
+              `${label} timed out after ${Math.round(ms / 1000)}s without a response. Please re-scan.`
             )
-          ),
-        ms
-      )
+          )
+          // Stop the fetch or retry sleep instead of leaving requests running
+          // after the scan has already failed.
+          controller.abort()
+        }, allowance)
+      }
+      resetTimeout()
     })
-    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
+    const request = Promise.resolve().then(() => startRequest(resetTimeout, controller.signal))
+    return Promise.race([request, timeout]).finally(() => clearTimeout(timer))
   }
 
   try {
@@ -146,16 +156,40 @@ async function getAllMediaItems(requestId, args) {
     const accountUrlPrefix =
       window.location.pathname.match(/^\/u\/\d+\//)?.[0] || "/"
 
+    // Google rejects EzkLib for some accounts. Taken-date pagination uses
+    // lcxiM and must read every page: upload watermarks do not apply here.
     do {
       assertAccount()
       const pageStart = performance.now()
       let page
       try {
         page = await withTimeout(
-          gptkApi.getItemsByUploadedDate(nextPageId, true, (attempt) => {
-            metrics.requestAttempts = (metrics.requestAttempts ?? 0) + 1
-            metrics.retries = (metrics.retries ?? 0) + (attempt > 1 ? 1 : 0)
-          }),
+          (resetTimeout, signal) => gptkApi.getItemsByTakenDate(
+            null,
+            null,
+            nextPageId,
+            500,
+            true,
+            (attempt) => {
+              resetTimeout()
+              metrics.requestAttempts = (metrics.requestAttempts ?? 0) + 1
+              metrics.retries = (metrics.retries ?? 0) + (attempt > 1 ? 1 : 0)
+              if (attempt > 1) {
+                postProgress(requestId, metrics.itemsEmitted, `Retrying library page (attempt ${attempt})`)
+              }
+            },
+            {
+              signal,
+              onRetry: ({ attempt, maxAttempts, delayMs, rateLimited }) => {
+                resetTimeout(PAGE_TIMEOUT_MS + delayMs)
+                const reason = rateLimited
+                  ? "Google Photos may be limiting requests."
+                  : "Google Photos could not return this library page."
+                postProgress(requestId, metrics.itemsEmitted,
+                  `${reason} Waiting ${Math.ceil(delayMs / 1000)}s before retry ${attempt + 1} of ${maxAttempts}.`)
+              }
+            }
+          ),
           PAGE_TIMEOUT_MS,
           "Fetching page from Google Photos"
         )
@@ -173,13 +207,6 @@ async function getAllMediaItems(requestId, args) {
       metrics.pageItems.push(page.items.length)
       const pageItems = []
       for (const item of page.items) {
-        // Read the entire watermark timestamp, even when ties span pages.
-        // Equal-timestamp uploads may be absent from the previous snapshot.
-        if (sinceTimestamp !== null && Number.isFinite(item.creationTimestamp) &&
-            item.creationTimestamp < sinceTimestamp) {
-          metrics.reachedCache = true
-          break
-        }
         pageItems.push({
           mediaKey: item.mediaKey,
           dedupKey: item.dedupKey,
@@ -191,6 +218,7 @@ async function getAllMediaItems(requestId, args) {
           duration: item.duration,
           isOwned: item.isOwned,
           isOriginalQuality: item.isOriginalQuality ?? null,
+          isFavorite: item.isFavorite === true,
           fileName: item.descriptionShort || null,
           productUrl: "https://photos.google.com" + accountUrlPrefix + "photo/" + item.mediaKey
         })
@@ -208,10 +236,15 @@ async function getAllMediaItems(requestId, args) {
         for (const item of pageItems) mediaItems.push(item)
       }
       nextPageId = page.nextPageId || null
-      postProgress(requestId, metrics.itemsEmitted, `Fetched ${metrics.itemsEmitted} items`)
-      if (metrics.reachedCache) break
+      const oldest = pageItems[pageItems.length - 1]
+      const position = Number.isFinite(oldest?.timestamp) && oldest.timestamp > 0
+        ? { oldestTakenAt: oldest.timestamp } : undefined
+      postProgress(requestId, metrics.itemsEmitted, `Fetched ${metrics.itemsEmitted} items`, undefined, position)
       if (nextPageId && seenPageIds.has(nextPageId)) throw new Error("Library pagination repeated a page token")
-      if (nextPageId) seenPageIds.add(nextPageId)
+      if (nextPageId) {
+        seenPageIds.add(nextPageId)
+        await new Promise((resolve) => setTimeout(resolve, LIBRARY_PAGE_DELAY_MS))
+      }
     } while (nextPageId)
 
     metrics.elapsedMs = performance.now() - startedAt

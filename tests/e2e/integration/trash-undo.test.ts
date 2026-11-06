@@ -80,6 +80,48 @@ test("trashes selected groups and removes them from the UI", async () => {
   await page.close()
 })
 
+test("persists whole-group trash, warns before keeping no copy, and supports undo", async () => {
+  await clearStorage(context)
+  const { groups, mediaItems } = makeGroups(1, 2)
+  mediaItems[groups[0].mediaKeys[1]].isFavorite = true
+  await injectScanResults(context, groups, mediaItems, 2)
+  const stub = await openGptkStubPage(context)
+  const page = await openAppTab(context, extensionId)
+  await expect(page.getByText("1 Duplicate Group Found")).toBeVisible()
+
+  // Favorite selection survives our custom keep logic as well as the merge.
+  const cards = page.locator(".MuiCard-root")
+  await expect(cards.nth(0)).not.toContainText("Keep")
+  await expect(cards.nth(1)).toContainText("Keep")
+  await expect(page.getByLabel("Favorite in Google Photos", { exact: true })).toBeVisible()
+  await page.getByRole("button", { name: "Trash every photo in this group" }).click()
+  await expect.poll(() => context.serviceWorkers()[0].evaluate(async (groupId) => {
+    const { selections } = await chrome.storage.local.get("selections")
+    return selections?.keptOverrides[groupId]
+  }, groups[0].id)).toEqual([])
+  await page.reload()
+  await expect(page.getByRole("button", { name: "Keep the best photo in this group" })).toHaveAttribute("aria-pressed", "true")
+
+  await stub.evaluate(() => {
+    window.addEventListener("message", (event) => {
+      if (event.data?.app === "GPD" && event.data?.action === "gptkCommand" && event.data?.command === "trashItems")
+        (window as any).__wholeGroupTrash = event.data.args
+    })
+  })
+  await page.getByRole("button", { name: "Move 2 Duplicates to Trash" }).click()
+  await expect(page.getByRole("dialog")).toContainText("no copy will be kept")
+  await page.getByRole("button", { name: "Move to Trash", exact: true }).click()
+  await expect(page.getByText(/moved to trash/i)).toBeVisible()
+  const requested = await stub.evaluate(() => (window as any).__wholeGroupTrash)
+  expect(requested.mediaKeysToTrash).toEqual(groups[0].mediaKeys)
+  expect(requested.dedupKeys).toEqual(groups[0].mediaKeys.map((key) => mediaItems[key].dedupKey))
+  await page.getByRole("button", { name: "Undo", exact: true }).click()
+  await expect(page.getByText("1 Duplicate Group Found")).toBeVisible()
+  await expect(page.locator(".MuiCard-root")).toHaveCount(2)
+  await stub.close()
+  await page.close()
+})
+
 // ============================================================
 // Trash: multi-batch (> 250 items)
 // ============================================================

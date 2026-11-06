@@ -31,6 +31,9 @@ playwright-report/
 
 # Docs
 docs/
+# Keep new Markdown and local investigation notes out of commits.
+*.md
+/notes/
 
 # Claude Code
 .claude/settings.local.json

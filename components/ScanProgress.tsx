@@ -12,6 +12,7 @@ interface ScanProgressProps {
   totalEstimate: number
   message: string
   countLabel?: string
+  oldestTakenAt?: number
   onCancel?: () => void
 }
 
@@ -33,6 +34,13 @@ const PHASE_STEP: Record<ScanPhase, number> = {
 
 const TOTAL_STEPS = 4
 
+function formatPositionDate(ts: number | undefined): string | null {
+  if (ts === undefined || !Number.isFinite(ts) || ts <= 0) return null
+  return new Date(ts).toLocaleDateString(undefined, {
+    day: "numeric", month: "short", year: "numeric"
+  })
+}
+
 function formatEtr(seconds: number): string {
   if (seconds < 60) return `${Math.ceil(seconds)}s remaining`
   if (seconds < 3600) {
@@ -51,6 +59,7 @@ export function ScanProgress({
   totalEstimate,
   message,
   countLabel = "items processed",
+  oldestTakenAt,
   onCancel,
 }: ScanProgressProps) {
   const progress =
@@ -83,6 +92,7 @@ export function ScanProgress({
 
   const etaText = cachedEtrRef.current?.text ?? null
   const stepNum = PHASE_STEP[phase]
+  const takenText = phase === "fetching" ? formatPositionDate(oldestTakenAt) : null
 
   return (
     <Box sx={{ maxWidth: 480, mx: "auto", p: 4 }}>
@@ -119,6 +129,18 @@ export function ScanProgress({
           </Typography>
         )}
       </Box>
+
+      {takenText && (
+        <Typography variant="caption" color="text.secondary" data-testid="fetch-position" sx={{ display: "block", mb: 2 }}>
+          Reached photos taken {takenText}
+        </Typography>
+      )}
+
+      {message && (
+        <Typography variant="body2" color="text.secondary" role="status" sx={{ mt: 1 }}>
+          {message}
+        </Typography>
+      )}
 
       {onCancel && (
         <Box sx={{ mt: 3 }}>

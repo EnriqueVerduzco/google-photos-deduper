@@ -108,18 +108,12 @@ describe("ScanConfig — thumbnail download concurrency", () => {
 
 
 describe("ScanConfig — metadata refresh", () => {
-  it("defaults to recent uploads independently of matching mode", () => {
-    renderConfig({ scanMode: "full" })
+  it("explains full metadata refresh and cache reuse even with a legacy preference", () => {
+    renderConfig({ mediaRefreshMode: "incremental" })
     fireEvent.click(screen.getByRole("button", { name: "More options" }))
-    expect(screen.getByRole("button", { name: "Use Cache" })).toHaveAttribute(
-      "aria-pressed",
-      "true"
+    expect(screen.getByText(/Each scan refreshes your library details/)).toHaveTextContent(
+      "Cached thumbnails and image comparisons are reused"
     )
-  })
-  it("offers a full library reconciliation without changing similarity settings", () => {
-    const { onSettingsChange } = renderConfig()
-    fireEvent.click(screen.getByRole("button", { name: "More options" }))
-    fireEvent.click(screen.getByRole("button", { name: "Refresh entire library" }))
-    expect(onSettingsChange).toHaveBeenCalledWith({ mediaRefreshMode: "full" })
+    expect(screen.queryByRole("button", { name: "Use Cache" })).not.toBeInTheDocument()
   })
 })

@@ -28,6 +28,13 @@ export interface HealthCheckResultMessage extends BaseMessage {
   success: boolean;
   hasGptk: boolean;
   accountEmail?: string;
+  /**
+   * Why a failed check failed. "no_tab" means no photos.google.com tab is open
+   * at all, so retrying cannot help and the app should show the error at once.
+   * Absent when a tab exists but its bridge did not answer, which is often a
+   * tab that is still loading and worth retrying.
+   */
+  reason?: "no_tab";
 }
 
 // ============================================================
@@ -173,6 +180,12 @@ export interface GptkProgressMessage extends BaseMessage {
   message?: string;
   /** Set by batch operations (e.g. "trashItems") so the app can route progress correctly. */
   command?: string;
+  /**
+   * Taken date of the oldest item fetched so far. Pagination runs newest-first
+   * by taken date, so this walks backwards monotonically and shows how far
+   * through the library the fetch has reached.
+   */
+  oldestTakenAt?: number;
 }
 
 export interface GptkLogMessage extends BaseMessage {
@@ -221,6 +234,12 @@ export interface GpdMediaItem {
   size?: number;
   isOwned?: boolean;
   isOriginalQuality?: boolean | null;
+  /**
+   * Whether the user starred this item in Google Photos. Google omits the
+   * underlying field rather than sending false, so absent means "not
+   * favorited" — always test for `=== true`.
+   */
+  isFavorite?: boolean;
   duration?: number; // video duration (undefined for photos)
 }
 
@@ -241,7 +260,10 @@ export interface StoredState {
     groups: DuplicateGroup[];
     scanDate: number;
     totalItems: number;
-    newestCreationTimestamp?: number; // for incremental fetch on next scan
+    // Timestamp buckets split to bound comparison cost; > 0 means the scan
+    // may have missed duplicates spanning a split. Absent on results saved
+    // before this was recorded.
+    bucketsSplit?: number;
     accountEmail?: string;
   };
   selections?: {
@@ -252,7 +274,7 @@ export interface StoredState {
 }
 
 export interface ScanSettings {
-  /** Incremental metadata refresh, or a complete reconciliation with the library. */
+  /** Legacy preference. Taken-date metadata fetching always reconciles the full library. */
   mediaRefreshMode?: "incremental" | "full";
   similarityThreshold: number;
   scanMode: ScanMode;

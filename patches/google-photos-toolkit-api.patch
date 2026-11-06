@@ -1,0 +1,221 @@
+diff --git a/src/api/api.ts b/src/api/api.ts
+index 805debf..4b88275 100644
+--- a/src/api/api.ts
++++ b/src/api/api.ts
+@@ -23,6 +23,41 @@ import type {
+ 
+ /* eslint-disable @typescript-eslint/no-explicit-any */
+ 
++export interface ApiRetryInfo {
++  /** The attempt that failed (1-based). */
++  attempt: number;
++  maxAttempts: number;
++  delayMs: number;
++  rateLimited: boolean;
++}
++
++interface ApiRequestOptions {
++  signal?: AbortSignal;
++  onRetry?: (info: ApiRetryInfo) => void;
++}
++
++class ApiRequestError extends Error {
++  constructor(message: string, readonly rateLimited = false) {
++    super(message);
++    this.name = 'ApiRequestError';
++  }
++}
++
++function waitForRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
++  return new Promise((resolve, reject) => {
++    const abort = () => {
++      clearTimeout(timer);
++      reject(signal?.reason ?? new DOMException('Aborted', 'AbortError'));
++    };
++    const timer = setTimeout(() => {
++      signal?.removeEventListener('abort', abort);
++      resolve();
++    }, delayMs);
++    if (signal?.aborted) abort();
++    else signal?.addEventListener('abort', abort, { once: true });
++  });
++}
++
+ /**
+  * Low-level client for Google Photos' undocumented `batchexecute` RPC API.
+  *
+@@ -37,6 +72,9 @@ import type {
+ export default class Api {
+   private static readonly MAX_RETRIES = 3;
+   private static readonly RETRY_BASE_DELAY_MS = 2000;
++  private static readonly RATE_LIMIT_MAX_ATTEMPTS = 5;
++  private static readonly RATE_LIMIT_BASE_DELAY_MS = 10_000;
++  private static readonly RATE_LIMIT_MAX_DELAY_MS = 60_000;
+ 
+   /**
+    * Core RPC request with retry and response validation.
+@@ -49,9 +87,16 @@ export default class Api {
+    *
+    * @param rpcid - The RPC method identifier (e.g. `'lcxiM'`, `'EzkLib'`).
+    * @param requestData - The payload to send, will be JSON-stringified.
++   * @param onAttempt - Optional observer, called before each network attempt (1-based).
++   * @param options - Optional cancellation signal and retry observer.
+    * @returns The parsed JSON payload from the `wrb.fr` envelope.
+    */
+-  async makeApiRequest(rpcid: string, requestData: unknown): Promise<any> {
++  async makeApiRequest(
++    rpcid: string,
++    requestData: unknown,
++    onAttempt?: (attempt: number) => void,
++    options: ApiRequestOptions = {}
++  ): Promise<any> {
+     const wrappedData: unknown[][][] = [[[rpcid, JSON.stringify(requestData), null, 'generic']]];
+ 
+     const requestDataString = `f.req=${encodeURIComponent(JSON.stringify(wrappedData))}&at=${encodeURIComponent(windowGlobalData.at)}&`;
+@@ -73,9 +118,12 @@ export default class Api {
+     const url = `https://photos.google.com${windowGlobalData.path}data/batchexecute?${paramsString}`;
+ 
+     let lastError: Error | null = null;
++    let maxAttempts = Api.MAX_RETRIES;
+ 
+-    for (let attempt = 1; attempt <= Api.MAX_RETRIES; attempt++) {
++    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+       try {
++        options.signal?.throwIfAborted();
++        onAttempt?.(attempt);
+         const response = await fetch(url, {
+           headers: {
+             'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+@@ -83,10 +131,16 @@ export default class Api {
+           body: requestDataString,
+           method: 'POST',
+           credentials: 'include',
++          signal: options.signal,
+         });
+ 
+         if (!response.ok) {
+-          throw new Error(`HTTP ${response.status} ${response.statusText}`);
++          throw new ApiRequestError(
++            response.status === 429
++              ? `Google Photos is limiting requests (HTTP 429) for ${rpcid}. Wait a few minutes and try again.`
++              : `${rpcid}: HTTP ${response.status} ${response.statusText}`,
++            response.status === 429
++          );
+         }
+ 
+         const responseBody = await response.text();
+@@ -101,25 +155,53 @@ export default class Api {
+           throw new Error('No wrb.fr envelope found in response');
+         }
+ 
+-        const parsedData = JSON.parse(jsonLines[0]);
++        // A frame can contain multiple rows. Match this RPC instead of assuming
++        // its result is the first row, and preserve Google's error status.
++        const envelope = jsonLines
++          .flatMap((line) => JSON.parse(line) as unknown[])
++          .find((row: any) => Array.isArray(row) && row[0] === 'wrb.fr' && row[1] === rpcid) as any;
++
++        if (!envelope) {
++          throw new Error(`No ${rpcid} result found in response`);
++        }
++
++        const status = envelope[5]?.[0] as unknown;
++        if (typeof status === 'number' && status !== 0) {
++          // Photos' private endpoint does not document these codes. Status 8
++          // is consistent with Google's RESOURCE_EXHAUSTED status; back off
++          // without claiming which particular quota or resource was exhausted.
++          throw new ApiRequestError(
++            status === 8
++              ? `Google Photos returned RPC status 8 for ${rpcid} (possible throttling or resource limit). Wait a few minutes and try again.`
++              : `Google Photos rejected ${rpcid} (RPC status ${status}). Reload the Google Photos tab and try again.`,
++            status === 8
++          );
++        }
+ 
+-        if (!parsedData?.[0]?.[2]) {
+-          throw new Error('Missing payload in parsed response');
++        if (typeof envelope[2] !== 'string' || !envelope[2]) {
++          throw new Error(`Missing payload in ${rpcid} response`);
+         }
+ 
+-        return JSON.parse(parsedData[0][2]);
++        return JSON.parse(envelope[2]);
+       } catch (error) {
++        if (options.signal?.aborted) throw error;
+         lastError = error instanceof Error ? error : new Error(String(error));
+-        console.error(`Error in ${rpcid} request (attempt ${attempt}/${Api.MAX_RETRIES}):`, lastError.message);
++        const rateLimited = lastError instanceof ApiRequestError && lastError.rateLimited;
++        if (rateLimited) maxAttempts = Api.RATE_LIMIT_MAX_ATTEMPTS;
++        console.error(`Error in ${rpcid} request (attempt ${attempt}/${maxAttempts}):`, lastError.message);
+ 
+-        if (attempt < Api.MAX_RETRIES) {
+-          const delay = Api.RETRY_BASE_DELAY_MS * attempt;
+-          await new Promise((resolve) => setTimeout(resolve, delay));
++        if (attempt < maxAttempts) {
++          const delayMs = rateLimited
++            ? Math.min(Api.RATE_LIMIT_BASE_DELAY_MS * 2 ** (attempt - 1), Api.RATE_LIMIT_MAX_DELAY_MS)
++              + Math.floor(Math.random() * 1000)
++            : Api.RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
++          options.onRetry?.({ attempt, maxAttempts, delayMs, rateLimited });
++          await waitForRetry(delayMs, options.signal);
+         }
+       }
+     }
+ 
+-    throw lastError ?? new Error(`${rpcid} request failed after ${Api.MAX_RETRIES} attempts`);
++    throw lastError ?? new Error(`${rpcid} request failed after ${maxAttempts} attempts`);
+   }
+ 
+   /**
+@@ -132,6 +214,8 @@ export default class Api {
+    * @param pageId - Continuation token from a previous page's `nextPageId`.
+    * @param pageSize - Number of items per page (default `500`).
+    * @param parseResponse - When `false`, returns the raw API response.
++   * @param onAttempt - Optional observer for initial request and retry attempts.
++   * @param options - Optional cancellation signal and retry observer.
+    * @returns A page of library items with `nextPageId` and `lastItemTimestamp`.
+    */
+   async getItemsByTakenDate(
+@@ -139,7 +223,9 @@ export default class Api {
+     source: string | null = null,
+     pageId: string | null = null,
+     pageSize = 500,
+-    parseResponse = true
++    parseResponse = true,
++    onAttempt?: (attempt: number) => void,
++    options?: ApiRequestOptions
+   ): Promise<LibraryTimelinePage> {
+     let sourceCode: number;
+     if (source === 'library') sourceCode = 1;
+@@ -149,7 +235,7 @@ export default class Api {
+     const rpcid = 'lcxiM';
+     const requestData = [pageId, timestamp, pageSize, null, 1, sourceCode];
+     try {
+-      const response = await this.makeApiRequest(rpcid, requestData);
++      const response = await this.makeApiRequest(rpcid, requestData, onAttempt, options);
+       if (parseResponse) return parser(response, rpcid) as LibraryTimelinePage;
+       return response;
+     } catch (error) {
+@@ -163,16 +249,20 @@ export default class Api {
+    *
+    * @param pageId - Continuation token from a previous page's `nextPageId`.
+    * @param parseResponse - When `false`, returns the raw API response.
++   * @param onAttempt - Optional observer for initial request and retry attempts.
++   * @param options - Optional cancellation signal and retry observer.
+    * @returns A page of library items with `nextPageId`.
+    */
+   async getItemsByUploadedDate(
+     pageId: string | null = null,
+-    parseResponse = true
++    parseResponse = true,
++    onAttempt?: (attempt: number) => void,
++    options?: ApiRequestOptions
+   ): Promise<LibraryGenericPage> {
+     const rpcid = 'EzkLib';
+     const requestData = ['', [[4, 'ra', 0, 0]], pageId];
+     try {
+-      const response = await this.makeApiRequest(rpcid, requestData);
++      const response = await this.makeApiRequest(rpcid, requestData, onAttempt, options);
+       if (parseResponse) return parser(response, rpcid) as LibraryGenericPage;
+       return response;
+     } catch (error) {

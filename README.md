@@ -44,6 +44,12 @@ npm run dev  # builds into build/chrome-mv3-dev/
 
 Load in Chrome: `chrome://extensions` → enable **Developer mode** → **Load unpacked** → select `build/chrome-mv3-dev/`.
 
+This fork keeps its Toolkit RPC retry, cancellation, and request-metric changes
+in `patches/google-photos-toolkit-api.patch`. The build applies that patch to a
+clean submodule, skips it when already applied, and stops on conflicting local
+edits. Metadata scans use the taken-date listing; thumbnails and embeddings
+continue to use their local caches.
+
 ### Commands
 
 ```bash

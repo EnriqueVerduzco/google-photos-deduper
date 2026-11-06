@@ -23,6 +23,7 @@ interface Props {
   message?: string
   countLabel?: string
   onCancel?: (() => void) | undefined
+  oldestTakenAt?: number | undefined
 }
 
 function renderScanProgress(props: Props = {}) {
@@ -33,6 +34,7 @@ function renderScanProgress(props: Props = {}) {
     message: "",
     countLabel: "items processed",
     onCancel: undefined,
+    oldestTakenAt: undefined,
   }
   const merged = { ...defaults, ...props }
   return render(
@@ -124,6 +126,54 @@ describe("ScanProgress", () => {
     it("shows 'Scanning Library' heading", () => {
       renderScanProgress()
       expect(screen.getByText("Scanning Library")).toBeInTheDocument()
+    })
+  })
+
+  // ============================================================
+  // Fetch position readout
+  //
+  // Pagination is newest-first by UPLOAD date, so the upload date walks
+  // backwards monotonically and is the honest "how far have we got" signal.
+  // The taken date is shown alongside because the two often diverge.
+  // ============================================================
+
+  describe("fetch position", () => {
+    const JUL_2019 = Date.parse("2019-07-04T10:00:00Z")
+
+    it("shows the taken-date position during the fetching phase", () => {
+      renderScanProgress({ phase: "fetching", oldestTakenAt: JUL_2019 })
+      const el = screen.getByTestId("fetch-position")
+      expect(el).toHaveTextContent(/taken/i)
+      expect(el).toHaveTextContent(/2019/)
+    })
+
+    it("renders nothing when no taken date has arrived yet", () => {
+      renderScanProgress({ phase: "fetching" })
+      expect(screen.queryByTestId("fetch-position")).not.toBeInTheDocument()
+    })
+
+    // Items with a 0 or non-finite timestamp exist in real libraries; they must
+    // not render as 1 Jan 1970.
+    it("renders nothing for a zero timestamp", () => {
+      renderScanProgress({ phase: "fetching", oldestTakenAt: 0 })
+      expect(screen.queryByTestId("fetch-position")).not.toBeInTheDocument()
+    })
+
+    it("renders nothing for a non-finite timestamp", () => {
+      renderScanProgress({ phase: "fetching", oldestTakenAt: NaN })
+      expect(screen.queryByTestId("fetch-position")).not.toBeInTheDocument()
+    })
+
+    it("is only shown while fetching, not in later phases", () => {
+      for (const phase of [
+        "downloading_thumbnails",
+        "computing_embeddings",
+        "detecting_duplicates",
+      ] as ScanPhase[]) {
+        const { unmount } = renderScanProgress({ phase, oldestTakenAt: JUL_2019 })
+        expect(screen.queryByTestId("fetch-position")).not.toBeInTheDocument()
+        unmount()
+      }
     })
   })
 })
