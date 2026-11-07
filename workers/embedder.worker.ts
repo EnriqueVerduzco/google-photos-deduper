@@ -20,8 +20,13 @@
 import { ImageEmbedder } from "@mediapipe/tasks-vision";
 
 import { fullCommunityDetection } from "../lib/full-matcher";
+import { detectSmartBucket } from "../lib/smart-matcher";
+import { SmartMatchCache } from "../lib/smart-match-cache";
 
 let embedder: ImageEmbedder | null = null;
+let canvas: OffscreenCanvas | null = null;
+let context: OffscreenCanvasRenderingContext2D | null = null;
+let smartCachePromise: Promise<SmartMatchCache | null> | undefined;
 
 self.addEventListener("message", async (event: MessageEvent) => {
   const { type, data } = event.data;
@@ -65,26 +70,27 @@ self.addEventListener("message", async (event: MessageEvent) => {
     const results: Array<{ localIdx: number; embedding: ArrayBuffer }> = [];
 
     for (const { localIdx, blob } of items) {
+      let bitmap: ImageBitmap | undefined;
       try {
-        const bitmap = await createImageBitmap(blob);
-        const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-        const ctx = canvas.getContext("2d")!;
-        ctx.drawImage(bitmap, 0, 0);
-        const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
-
+        bitmap = await createImageBitmap(blob);
+        if (!canvas) {
+          canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+          context = canvas.getContext("2d");
+        }
+        if (canvas.width !== bitmap.width) canvas.width = bitmap.width;
+        if (canvas.height !== bitmap.height) canvas.height = bitmap.height;
+        // Preserve the old transparent, fresh-canvas pixel path exactly.
+        context!.clearRect(0, 0, canvas.width, canvas.height);
+        context!.drawImage(bitmap, 0, 0);
+        const imageData = context!.getImageData(0, 0, bitmap.width, bitmap.height);
         const result = embedder!.embed(imageData);
         if (result?.embeddings?.[0]?.floatEmbedding) {
-          // .slice(0) to detach the buffer from any shared backing store before transfer
-          const buf = new Float32Array(
-            result.embeddings[0].floatEmbedding,
-          ).buffer.slice(0);
+          const buf = new Float32Array(result.embeddings[0].floatEmbedding).buffer;
           results.push({ localIdx, embedding: buf });
         }
-
-        bitmap.close();
       } catch {
-        // Skip unprocessable images
-      }
+        // Keep the existing behavior for genuinely unprocessable images.
+      } finally { bitmap?.close(); }
     }
 
     const transferables = results.map((r) => r.embedding);
@@ -115,56 +121,42 @@ self.addEventListener("message", async (event: MessageEvent) => {
   }
 
   if (type === "detectSmart") {
-    const { flatEmbeddings, n, dim, threshold, buckets } = data as {
-      flatEmbeddings: Float32Array;
-      n: number;
-      dim: number;
-      threshold: number;
-      buckets: number[][];
-    };
-
-    // Unpack flat buffer into row views (zero-copy)
-    const embeddings: Float32Array[] = [];
-    for (let i = 0; i < n; i++)
-      embeddings.push(flatEmbeddings.subarray(i * dim, (i + 1) * dim));
-
-    const allGroups: number[][] = [];
-    for (let bi = 0; bi < buckets.length; bi++) {
-      const bucket = buckets[bi];
-      // Union-Find over bucket indices
-      const parent = bucket.map((_, j) => j);
-      const find = (x: number): number =>
-        parent[x] === x ? x : (parent[x] = find(parent[x]));
-      const union = (a: number, b: number) => {
-        parent[find(a)] = find(b);
+    try {
+      const { flatEmbeddings, n, dim, threshold, buckets, mediaKeys } = data as {
+        flatEmbeddings: Float32Array; n: number; dim: number; threshold: number;
+        buckets: number[][]; mediaKeys?: string[];
       };
-
-      for (let i = 0; i < bucket.length; i++) {
-        for (let j = i + 1; j < bucket.length; j++) {
-          const a = embeddings[bucket[i]];
-          const b = embeddings[bucket[j]];
-          let dot = 0;
-          for (let k = 0; k < dim; k++) dot += a[k] * b[k];
-          if (dot >= threshold) union(i, j);
+      const rows = Array.from({ length: n }, (_, i) => flatEmbeddings.subarray(i * dim, (i + 1) * dim));
+      const allGroups: number[][] = [];
+      let cacheHits = 0, lastProgress = 0;
+      const cache = mediaKeys ? await (smartCachePromise ??= SmartMatchCache.open()) : null;
+      for (let bi = 0; bi < buckets.length; bi++) {
+        const bucket = buckets[bi];
+        const bucketRows = bucket.map((index) => rows[index]);
+        let key: string | undefined;
+        let groups: number[][] | null = null;
+        // Tiny buckets are cheaper to compare than to hash and read from IDB.
+        if (cache && bucket.length >= 64 && mediaKeys) {
+          try {
+            key = await cache.fingerprint(bucket.map((index) => mediaKeys[index]), bucketRows, threshold);
+            groups = await cache.get(key, bucket.length);
+            if (groups) cacheHits++;
+          } catch { /* Cache availability never affects detection. */ }
+        }
+        if (!groups) {
+          groups = detectSmartBucket(bucketRows, threshold);
+          if (cache && key) await cache.put(key, bucket.length, groups);
+        }
+        for (const group of groups) allGroups.push(group.map((index) => bucket[index]));
+        const now = performance.now();
+        if (bi + 1 === buckets.length || now - lastProgress >= 100) {
+          self.postMessage({ type: "detectionProgress", current: bi + 1, total: buckets.length });
+          lastProgress = now;
         }
       }
-
-      const components = new Map<number, number[]>();
-      for (let i = 0; i < bucket.length; i++) {
-        const root = find(i);
-        if (!components.has(root)) components.set(root, []);
-        components.get(root)!.push(bucket[i]); // original embedding indices
-      }
-      for (const [, members] of components)
-        if (members.length >= 2) allGroups.push(members);
-
-      // Report every bucket, not every 100th. Buckets are capped upstream
-      // (see MAX_BUCKET_SIZE), but comparison cost is quadratic in bucket
-      // size, so a batch of 100 large buckets could otherwise leave the
-      // progress bar frozen for minutes with the scan looking hung.
-      self.postMessage({ type: "detectionProgress", current: bi + 1, total: buckets.length });
+      self.postMessage({ type: "detectionResults", groups: allGroups, cacheHits });
+    } catch (error) {
+      self.postMessage({ type: "detectionError", message: String(error) });
     }
-
-    self.postMessage({ type: "detectionResults", groups: allGroups });
   }
 });
