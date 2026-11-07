@@ -647,7 +647,7 @@ describe("getAllMediaItems — full-library streaming", () => {
     expect(messages.filter((m: any) => m.action === "gptkMediaPage")).toHaveLength(1)
     expect(messages.some((m: any) => m.action === "gptkMediaComplete")).toBe(false)
     expect(api).toHaveBeenCalledTimes(1)
-    await flush(999)
+    await flush(499)
     expect(api).toHaveBeenCalledTimes(1)
     finishSecond({ items: [media("tie2", 200), media("old", 100)], nextPageId: null })
     await flush(1)
@@ -888,5 +888,39 @@ describe("getAllMediaItems — listing source", () => {
 
     expect(findMediaItemsResult(messages)?.data.map((i: any) => i.mediaKey)).toEqual(["old"])
     restore()
+  })
+})
+
+describe("getAllMediaItems — adaptive pacing", () => {
+  afterEach(() => { delete (window as any).gptkApi })
+
+  it("reduces the delay only after healthy pages and always fetches every page", async () => {
+    const start = Date.now(), times: number[] = []
+    ;(window as any).gptkApi = { getItemsByTakenDate: vi.fn(async () => {
+      times.push(Date.now() - start)
+      return { items: [], nextPageId: times.length < 6 ? String(times.length) : null }
+    }) }
+    const { messages } = collectMessages()
+    sendCommand("getAllMediaItems", "healthy-pacing", { streamResults: true })
+    await vi.runAllTimersAsync()
+    expect(times).toEqual([0, 500, 1000, 1500, 1850, 2200])
+    expect(messages.some((message: any) => message.action === "gptkMediaComplete")).toBe(true)
+  })
+
+  it("slows down subsequent pages after a throttling response", async () => {
+    const start = Date.now(), times: number[] = []
+    ;(window as any).gptkApi = { getItemsByTakenDate: vi.fn(async (_t, _s, _p, _n, _parse, onAttempt, options) => {
+      times.push(Date.now() - start)
+      onAttempt(1)
+      if (times.length === 1) {
+        options.onRetry({ attempt: 1, maxAttempts: 5, delayMs: 10_000, rateLimited: true })
+        onAttempt(2)
+      }
+      return { items: [], nextPageId: times.length < 3 ? String(times.length) : null }
+    }) }
+    collectMessages()
+    sendCommand("getAllMediaItems", "throttled-pacing", {})
+    await vi.runAllTimersAsync()
+    expect(times).toEqual([0, 1000, 2000])
   })
 })

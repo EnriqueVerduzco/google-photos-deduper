@@ -7,11 +7,14 @@
 // 3. Group duplicates using fast community detection (cosine similarity)
 
 import type { GpdMediaItem, DuplicateGroup } from "./types";
-import { buildThumbUrl } from "./photo-url";
 import { StabilityTracker } from "./scan-log";
-import type { ScanLogger, ThumbnailDownloadMetrics } from "./scan-log";
+import type { ScanLogger } from "./scan-log";
+import { prepareEmbeddings } from "./embedding-pipeline";
+export { fetchThumbnails } from "./thumbnail-downloads";
+export type { FetchThumbnailsResult } from "./thumbnail-downloads";
 import { topK } from "./top-k";
 import { fullDetectionWorkTotal } from "./full-matcher";
+import { runSmartWorkerPool } from "./smart-worker-pool";
 
 export { topK } from "./top-k";
 
@@ -62,103 +65,6 @@ export function dedupeByDedupKey(items: GpdMediaItem[]): GpdMediaItem[] {
     uniqueItems.push(item);
   }
   return uniqueItems;
-}
-
-const MODEL_URL =
-  "https://storage.googleapis.com/mediapipe-models/image_embedder/mobilenet_v3_large/float32/latest/mobilenet_v3_large.tflite";
-
-// Thumbnail height for embedding computation. Larger = more accurate but slower.
-const THUMB_HEIGHT = 200;
-
-// ============================================================
-// Embedding cache (IndexedDB)
-// Keyed by mediaKey. Bump CACHE_VERSION to invalidate all entries
-// (e.g. when switching to a different model).
-// ============================================================
-
-const EMBEDDING_DB_NAME = "gpd-embeddings";
-const EMBEDDING_STORE = "embeddings";
-const EMBEDDING_CACHE_VERSION = 1;
-
-function openEmbeddingDb(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(EMBEDDING_DB_NAME, EMBEDDING_CACHE_VERSION);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      if (!db.objectStoreNames.contains(EMBEDDING_STORE)) {
-        db.createObjectStore(EMBEDDING_STORE);
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-function setCachedEmbedding(
-  db: IDBDatabase,
-  key: string,
-  embedding: Float32Array,
-): void {
-  try {
-    const tx = db.transaction(EMBEDDING_STORE, "readwrite");
-    tx.objectStore(EMBEDDING_STORE).put(embedding.buffer.slice(0), key);
-  } catch {
-    // Ignore cache write errors — cache is best-effort
-  }
-}
-
-// Returns the set of all keys present in the embedding store.
-// Uses getAllKeys() — a single efficient IDB call, no matter how large the store.
-function loadCachedEmbeddingKeys(db: IDBDatabase): Promise<Set<string>> {
-  return new Promise((resolve) => {
-    const req = db
-      .transaction(EMBEDDING_STORE, "readonly")
-      .objectStore(EMBEDDING_STORE)
-      .getAllKeys();
-    req.onsuccess = () => resolve(new Set(req.result as string[]));
-    req.onerror = () => resolve(new Set());
-  });
-}
-
-// Loads all cached embedding values in two bulk IDB calls (getAllKeys + getAll),
-// then maps them back to candidate indices. Far cheaper than one get() per item.
-function loadAllCachedEmbeddings(
-  db: IDBDatabase,
-  keyToIndex: Map<string, number>,
-): Promise<Map<number, Float32Array>> {
-  return new Promise((resolve) => {
-    const result = new Map<number, Float32Array>();
-    const tx = db.transaction(EMBEDDING_STORE, "readonly");
-    const store = tx.objectStore(EMBEDDING_STORE);
-
-    let allKeys: string[] | null = null;
-    let allValues: unknown[] | null = null;
-
-    const tryResolve = () => {
-      if (allKeys === null || allValues === null) return;
-      for (let i = 0; i < allKeys.length; i++) {
-        const idx = keyToIndex.get(allKeys[i]);
-        if (idx !== undefined && allValues[i] instanceof ArrayBuffer) {
-          result.set(idx, new Float32Array(allValues[i] as ArrayBuffer));
-        }
-      }
-      resolve(result);
-    };
-
-    const keysReq = store.getAllKeys();
-    keysReq.onsuccess = () => {
-      allKeys = keysReq.result as string[];
-      tryResolve();
-    };
-    keysReq.onerror = () => resolve(result);
-
-    const valsReq = store.getAll();
-    valsReq.onsuccess = () => {
-      allValues = valsReq.result;
-      tryResolve();
-    };
-    valsReq.onerror = () => resolve(result);
-  });
 }
 
 export interface DetectionProgress {
@@ -219,69 +125,13 @@ export async function fullDetectDuplicates(
 
   if (candidates.length < 2) return { groups: [], timing: emptyTiming() };
 
-  const keys = candidates.map((item) => item.mediaKey);
-
-  // Open embedding cache DB. Used in two stages below.
-  let db: IDBDatabase | null = null;
-  try {
-    db = await openEmbeddingDb();
-  } catch {
-    /* cache unavailable */
-  }
-
-  // Stage A: get cached key set via a single getAllKeys() call.
-  // Only the set of keys is needed here — no embedding values loaded yet.
-  // This tells fetchThumbnails which items to skip downloading.
-  const cachedKeySet: Set<string> = db
-    ? await loadCachedEmbeddingKeys(db)
-    : new Set();
-  const cacheHits = keys.filter((k) => cachedKeySet.has(k)).length;
-  console.log(
-    `[GPD] embedding cache: ${cacheHits}/${candidates.length} hits, skipping thumbnails`,
-  );
-
-  // Inform logger of candidates/cacheHits now that they're known.
-  // Fire-and-forget — runs concurrently with thumbnail fetching.
-  logger?.updateInfo({ candidates: candidates.length, cacheHits });
-
-  // Wrap onProgress to feed stability tracking alongside the UI callback.
-  const stabilityTracker = new StabilityTracker((est) =>
-    logger?.recordStableEstimate(est),
-  );
+  const stabilityTracker = new StabilityTracker((estimate) => logger?.recordStableEstimate(estimate));
   const trackedProgress: ProgressCallback = (progress) => {
     onProgress?.(progress);
     stabilityTracker.update(progress.phase, progress.current, progress.total);
   };
-
-  // Step 1: Download thumbnails — skip items whose embedding is already cached
-  const t1 = performance.now();
-  const { blobs } = await fetchThumbnails(
-    candidates,
-    cachedKeySet,
-    trackedProgress,
-    signal,
-    logger,
-  );
-  const fetchThumbnailsMs = Math.round(performance.now() - t1);
-  await logger?.phaseComplete("fetchThumbnailsMs", fetchThumbnailsMs);
-
-  signal?.throwIfAborted();
-
-  // Step 2: Compute embeddings — values loaded in bulk inside computeEmbeddings
-  const t2 = performance.now();
-  const { embeddings, validIndices } = await computeEmbeddings(
-    blobs,
-    keys,
-    db,
-    cachedKeySet,
-    trackedProgress,
-    signal,
-  );
-  const computeEmbeddingsMs = Math.round(performance.now() - t2);
-  console.log(
-    `[GPD] computeEmbeddings: ${embeddings.length} items (${cacheHits} cached) in ${computeEmbeddingsMs}ms`,
-  );
-  await logger?.phaseComplete("computeEmbeddingsMs", computeEmbeddingsMs);
+  const { embeddings, validIndices, cacheHits, fetchThumbnailsMs, computeEmbeddingsMs } =
+    await prepareEmbeddings(candidates, trackedProgress, signal, logger);
 
   if (embeddings.length < 2) {
     return {
@@ -490,66 +340,6 @@ export function withinGroupDuplicates(
     });
 }
 
-/**
- * Packs embeddings and bucket index arrays, sends to worker for pairwise
- * union-find detection. Returns number[][] (group index lists into embeddings[]).
- */
-async function runSmartDetectionInWorker(
-  embeddings: Float32Array[],
-  threshold: number,
-  buckets: number[][],
-  workerUrl: string,
-  onProgress?: ProgressCallback,
-  signal?: AbortSignal,
-): Promise<number[][]> {
-  const n = embeddings.length;
-  if (n === 0) return [];
-  const dim = embeddings[0].length;
-
-  const flat = new Float32Array(n * dim);
-  for (let i = 0; i < n; i++) flat.set(embeddings[i], i * dim);
-
-  const worker = new Worker(workerUrl);
-
-  return new Promise<number[][]>((resolve, reject) => {
-    if (signal?.aborted) {
-      worker.terminate();
-      reject(new DOMException("Aborted", "AbortError"));
-      return;
-    }
-
-    const onAbort = () => {
-      worker.terminate();
-      reject(new DOMException("Aborted", "AbortError"));
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-
-    worker.onmessage = (e) => {
-      if (e.data.type === "detectionProgress") {
-        onProgress?.({
-          phase: "detecting_duplicates",
-          current: e.data.current,
-          total: e.data.total,
-        });
-      } else if (e.data.type === "detectionResults") {
-        signal?.removeEventListener("abort", onAbort);
-        worker.terminate();
-        resolve(e.data.groups as number[][]);
-      }
-    };
-    worker.onerror = (e) => {
-      signal?.removeEventListener("abort", onAbort);
-      worker.terminate();
-      reject(new Error(e.message ?? "Worker error during smart detection"));
-    };
-
-    worker.postMessage(
-      { type: "detectSmart", data: { flatEmbeddings: flat, n, dim, threshold, buckets } },
-      [flat.buffer],
-    );
-  });
-}
-
 export async function smartDetectDuplicates(
   mediaItems: GpdMediaItem[],
   threshold: number,
@@ -589,62 +379,12 @@ export async function smartDetectDuplicates(
         subset.push(item);
       }
 
-  const keys = subset.map((item) => item.mediaKey);
-
-  // Open embedding cache
-  let db: IDBDatabase | null = null;
-  try {
-    db = await openEmbeddingDb();
-  } catch {
-    /* cache unavailable */
-  }
-
-  const cachedKeySet: Set<string> = db
-    ? await loadCachedEmbeddingKeys(db)
-    : new Set();
-  const cacheHits = keys.filter((k) => cachedKeySet.has(k)).length;
-  console.log(
-    `[GPD] embedding cache: ${cacheHits}/${subset.length} hits, skipping thumbnails`,
-  );
-
-  logger?.updateInfo({ candidates: subset.length, cacheHits });
-
-  // Wrap onProgress to feed stability tracking alongside the UI callback.
-  const stabilityTracker = new StabilityTracker((est) =>
-    logger?.recordStableEstimate(est),
-  );
+  const stabilityTracker = new StabilityTracker((estimate) => logger?.recordStableEstimate(estimate));
   const trackedProgress: ProgressCallback = (progress) => {
     onProgress?.(progress);
     stabilityTracker.update(progress.phase, progress.current, progress.total);
   };
-
-  const t1 = performance.now();
-  const { blobs } = await fetchThumbnails(
-    subset,
-    cachedKeySet,
-    trackedProgress,
-    signal,
-    logger,
-  );
-  const fetchThumbnailsMs = Math.round(performance.now() - t1);
-  await logger?.phaseComplete("fetchThumbnailsMs", fetchThumbnailsMs);
-
-  signal?.throwIfAborted();
-
-  const t2 = performance.now();
-  const { embeddings, validIndices } = await computeEmbeddings(
-    blobs,
-    keys,
-    db,
-    cachedKeySet,
-    trackedProgress,
-    signal,
-  );
-  const computeEmbeddingsMs = Math.round(performance.now() - t2);
-  console.log(
-    `[GPD] computeEmbeddings: ${embeddings.length} items (${cacheHits} cached) in ${computeEmbeddingsMs}ms`,
-  );
-  await logger?.phaseComplete("computeEmbeddingsMs", computeEmbeddingsMs);
+  const { embeddings, validIndices } = await prepareEmbeddings(subset, trackedProgress, signal, logger);
 
   if (embeddings.length < 2) return { groups: [], bucketsSplit };
 
@@ -668,8 +408,9 @@ export async function smartDetectDuplicates(
   await new Promise<void>((r) => setTimeout(r, 0)); // flush React phase update
   const workerUrl = chrome.runtime.getURL("scripts/embedder-worker.js");
   const t3 = performance.now();
-  const indexGroups = await runSmartDetectionInWorker(
+  const indexGroups = await runSmartWorkerPool(
     embeddings,
+    validIndices.map((index) => subset[index].mediaKey),
     threshold,
     workerBuckets,
     workerUrl,
@@ -701,367 +442,6 @@ export async function smartDetectDuplicates(
     groups: groups.sort((a, b) => b.mediaKeys.length - a.mediaKeys.length),
     bucketsSplit,
   };
-}
-
-// ============================================================
-// Step 1: Fetch thumbnails
-// ============================================================
-
-const DEFAULT_THUMBNAIL_CONCURRENCY = 16;
-const THUMBNAIL_FETCH_TIMEOUT_MS = 8000;
-const THUMBNAIL_MAX_RETRIES = 2;
-const THUMBNAIL_RETRY_BASE_MS = 100;
-
-function waitForRetry(ms: number, signal?: AbortSignal): Promise<void> {
-  signal?.throwIfAborted();
-  return new Promise((resolve, reject) => {
-    const timeoutId = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timeoutId);
-      reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
-export interface FetchThumbnailsResult {
-  blobs: (Blob | null)[];
-  metrics: ThumbnailDownloadMetrics;
-}
-
-/**
- * Download uncached thumbnails with bounded concurrency and retries.
- * Exported so reliability/cancellation behavior can be unit tested without
- * invoking MediaPipe or accessing Google Photos.
- */
-export async function fetchThumbnails(
-  items: GpdMediaItem[],
-  cachedKeySet: Set<string>,
-  onProgress?: ProgressCallback,
-  signal?: AbortSignal,
-  logger?: ScanLogger,
-): Promise<FetchThumbnailsResult> {
-  const concurrency = DEFAULT_THUMBNAIL_CONCURRENCY;
-  const blobs: (Blob | null)[] = new Array(items.length).fill(null);
-  let completed = 0;
-  const startedAt = performance.now();
-  const metrics: ThumbnailDownloadMetrics = {
-    concurrency,
-    attempts: 0,
-    successes: 0,
-    failures: 0,
-    httpStatusFailures: 0,
-    throttledResponses: 0,
-    timeouts: 0,
-    retries: 0,
-    elapsedMs: 0,
-    effectivePerSecond: 0,
-  };
-
-  // Only enqueue items that don't have a cached embedding
-  const queue = items
-    .map((item, i) => ({ item, index: i }))
-    .filter(({ item }) => !cachedKeySet.has(item.mediaKey));
-
-  // Report progress only against items that actually need downloading.
-  // Counting cached items as "pre-completed" caused the bar to start at e.g. 80%
-  // and never visibly move before the phase transitioned.
-  const total = queue.length;
-
-  const reportProgress = () => {
-    if (total === 0) return;
-    if (completed % 50 === 0 || completed === total) {
-      onProgress?.({
-        phase: "downloading_thumbnails",
-        current: completed,
-        total,
-      });
-    }
-  };
-
-  const download = async (entry: { item: GpdMediaItem; index: number }) => {
-    const url = buildThumbUrl(entry.item.thumb, { height: THUMB_HEIGHT });
-    let lastFailure = "unknown error";
-
-    for (let attempt = 0; attempt <= THUMBNAIL_MAX_RETRIES; attempt++) {
-      signal?.throwIfAborted();
-      metrics.attempts++;
-
-      const attemptController = new AbortController();
-      let timedOut = false;
-      const onCancel = () => attemptController.abort(signal?.reason);
-      signal?.addEventListener("abort", onCancel, { once: true });
-      const timeoutId = setTimeout(() => {
-        timedOut = true;
-        attemptController.abort(
-          new DOMException("Thumbnail download timed out", "TimeoutError"),
-        );
-      }, THUMBNAIL_FETCH_TIMEOUT_MS);
-
-      let shouldRetry = false;
-      try {
-        const response = await fetch(url, {
-          credentials: "include",
-          signal: attemptController.signal,
-        });
-        if (response.ok) {
-          blobs[entry.index] = await response.blob();
-          metrics.successes++;
-          return;
-        }
-
-        metrics.httpStatusFailures++;
-        if (response.status === 429) metrics.throttledResponses++;
-        lastFailure = `HTTP ${response.status}`;
-        void response.body?.cancel().catch(() => {});
-        shouldRetry = response.status === 429 || response.status >= 500;
-      } catch (error) {
-        // A user cancellation takes precedence over timeout/network handling.
-        signal?.throwIfAborted();
-        if (timedOut) {
-          metrics.timeouts++;
-          lastFailure = "timeout";
-        } else {
-          lastFailure = error instanceof Error ? error.message : String(error);
-        }
-        // Fetch rejections other than user cancellation are transient network
-        // failures and are eligible for a bounded retry.
-        shouldRetry = true;
-      } finally {
-        clearTimeout(timeoutId);
-        signal?.removeEventListener("abort", onCancel);
-      }
-
-      if (!shouldRetry || attempt === THUMBNAIL_MAX_RETRIES) break;
-      metrics.retries++;
-      await waitForRetry(THUMBNAIL_RETRY_BASE_MS * 2 ** attempt, signal);
-    }
-
-    metrics.failures++;
-    console.warn(
-      `[GPD] thumbnail failed: mediaKey=${entry.item.mediaKey}, reason=${lastFailure}`,
-    );
-  };
-
-  const worker = async () => {
-    while (queue.length > 0) {
-      signal?.throwIfAborted();
-      const entry = queue.shift();
-      if (!entry) break;
-
-      await download(entry);
-
-      completed++;
-      reportProgress();
-    }
-  };
-
-  try {
-    const workers = Array.from(
-      { length: Math.min(concurrency, queue.length) },
-      () => worker(),
-    );
-    await Promise.all(workers);
-    return { blobs, metrics };
-  } finally {
-    metrics.elapsedMs = Math.round(performance.now() - startedAt);
-    metrics.effectivePerSecond =
-      metrics.elapsedMs > 0
-        ? Math.round((metrics.successes / (metrics.elapsedMs / 1000)) * 100) /
-          100
-        : 0;
-    console.log(
-      `[GPD] thumbnails: concurrency=${metrics.concurrency}, attempts=${metrics.attempts}, ` +
-        `successful=${metrics.successes}, failed=${metrics.failures}, ` +
-        `httpFailures=${metrics.httpStatusFailures}, throttled=${metrics.throttledResponses}, ` +
-        `timeouts=${metrics.timeouts}, ` +
-        `retries=${metrics.retries}, elapsed=${metrics.elapsedMs}ms, ` +
-        `rate=${metrics.effectivePerSecond}/sec`,
-    );
-    await logger?.recordThumbnailDownloads(metrics);
-  }
-}
-
-// ============================================================
-// Step 2: Compute embeddings via MediaPipe worker pool
-// ============================================================
-
-const WORKER_BATCH_SIZE = 20;
-
-async function computeEmbeddings(
-  blobs: (Blob | null)[],
-  keys: string[],
-  db: IDBDatabase | null,
-  cachedKeySet: Set<string>,
-  onProgress?: ProgressCallback,
-  signal?: AbortSignal,
-): Promise<{ embeddings: Float32Array[]; validIndices: number[] }> {
-  // Stage B: bulk-load embedding values for cached items in two IDB calls.
-  const keyToIndex = new Map(keys.map((k, i) => [k, i]));
-  const cachedEmbeddings: Map<number, Float32Array> =
-    db && cachedKeySet.size > 0
-      ? await loadAllCachedEmbeddings(db, keyToIndex)
-      : new Map();
-
-  // Collect items that actually need computation
-  const toCompute: Array<{ idx: number; blob: Blob }> = [];
-  for (let i = 0; i < blobs.length; i++) {
-    if (!cachedEmbeddings.has(i) && blobs[i]) {
-      toCompute.push({ idx: i, blob: blobs[i]! });
-    }
-  }
-
-  // Run worker pool for items needing computation
-  const newEmbeddings = new Map<number, Float32Array>();
-  if (toCompute.length > 0) {
-    signal?.throwIfAborted();
-
-    // Fetch model once on main thread; workers receive clones
-    let modelBuffer: ArrayBuffer;
-    try {
-      const resp = await fetch(MODEL_URL);
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      modelBuffer = await resp.arrayBuffer();
-    } catch (e) {
-      throw new Error(
-        `Failed to download model: ${e instanceof Error ? e.message : e}`,
-      );
-    }
-
-    const wasmLoaderUrl = chrome.runtime.getURL(
-      "scripts/vision_wasm_internal.js",
-    );
-    const wasmBinaryUrl = chrome.runtime.getURL(
-      "scripts/vision_wasm_internal.wasm",
-    );
-    const workerUrl = chrome.runtime.getURL("scripts/embedder-worker.js");
-    const numWorkers = Math.max(
-      1,
-      Math.min(navigator.hardwareConcurrency ?? 4, 8),
-    );
-
-    console.log(
-      `[GPD] embedding: ${toCompute.length} items, ${numWorkers} workers`,
-    );
-
-    // Create and init all workers in parallel
-    const workers = Array.from(
-      { length: numWorkers },
-      () => new Worker(workerUrl),
-    );
-
-    await Promise.all(
-      workers.map(
-        (w, i) =>
-          new Promise<void>((resolve, reject) => {
-            w.onmessage = (e) => {
-              if (e.data.type === "ready") resolve();
-              else if (e.data.type === "initError")
-                reject(new Error(e.data.message));
-            };
-            w.onerror = (e) => reject(new Error(e.message));
-            w.postMessage(
-              {
-                type: "init",
-                data: {
-                  wasmLoaderUrl,
-                  wasmBinaryUrl,
-                  modelBuffer: modelBuffer.slice(0),
-                },
-              },
-              [modelBuffer.slice(0)], // transfer a clone; main thread keeps original for next worker
-            );
-          }),
-      ),
-    ).catch((e) => {
-      workers.forEach((w) => w.terminate());
-      throw new Error(`Worker init failed: ${e.message}`);
-    });
-
-    // Work queue: pull-based dispatch so fast workers take more items
-    let queuePos = 0;
-    let completedItems = 0;
-    let pendingWorkers = numWorkers;
-
-    await new Promise<void>((resolve, reject) => {
-      signal?.addEventListener(
-        "abort",
-        () => {
-          workers.forEach((w) => w.terminate());
-          reject(new DOMException("Aborted", "AbortError"));
-        },
-        { once: true },
-      );
-
-      const dispatch = (w: Worker) => {
-        const start = queuePos;
-        if (start >= toCompute.length) {
-          if (--pendingWorkers === 0) resolve();
-          return;
-        }
-        queuePos = Math.min(start + WORKER_BATCH_SIZE, toCompute.length);
-        const batch = toCompute.slice(start, queuePos).map((item, j) => ({
-          localIdx: start + j,
-          blob: item.blob,
-        }));
-        w.postMessage({ type: "embed", data: { items: batch } });
-      };
-
-      workers.forEach((w) => {
-        w.onmessage = (e) => {
-          if (e.data.type !== "results") return;
-          for (const { localIdx, embedding } of e.data.results as Array<{
-            localIdx: number;
-            embedding: ArrayBuffer;
-          }>) {
-            const idx = toCompute[localIdx].idx;
-            const emb = new Float32Array(embedding);
-            newEmbeddings.set(idx, emb);
-            // Write to cache immediately — don't wait for all workers to finish.
-            // If the scan is cancelled or the tab is closed mid-run, embeddings
-            // computed so far are preserved and won't need recomputing next time.
-            if (db) setCachedEmbedding(db, keys[idx], emb);
-          }
-          completedItems += e.data.results.length;
-          onProgress?.({
-            phase: "computing_embeddings",
-            current: cachedEmbeddings.size + completedItems,
-            total: blobs.length,
-          });
-          dispatch(w);
-        };
-        w.onerror = () => dispatch(w); // skip failed worker batches
-        dispatch(w);
-      });
-    });
-
-    workers.forEach((w) => w.terminate());
-  }
-
-  // Final progress update if everything was cached (no workers ran)
-  if (toCompute.length === 0) {
-    onProgress?.({
-      phase: "computing_embeddings",
-      current: blobs.length,
-      total: blobs.length,
-    });
-  }
-
-  // Assemble result in original order
-  const embeddings: Float32Array[] = [];
-  const validIndices: number[] = [];
-  for (let i = 0; i < blobs.length; i++) {
-    const emb = cachedEmbeddings.get(i) ?? newEmbeddings.get(i);
-    if (emb) {
-      embeddings.push(emb);
-      validIndices.push(i);
-    }
-  }
-
-  return { embeddings, validIndices };
 }
 
 // ============================================================

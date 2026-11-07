@@ -17,11 +17,10 @@ import DeleteSweepIcon from "@mui/icons-material/DeleteSweep"
 import Tooltip from "@mui/material/Tooltip"
 import { useBlobUrl } from "./useBlobUrl"
 import { PhotoViewerModal } from "./PhotoViewerModal"
+import { VirtualGroupList } from "./VirtualGroupList"
 import { buildThumbUrl } from "../lib/photo-url"
 import type { GpdMediaItem, DuplicateGroup } from "../lib/types"
 import { isWholeGroupTrashed } from "../lib/kept-overrides"
-
-const PAGE_SIZE = 30
 
 /**
  * Label a group as "videos", "photos", or "items" depending on the kinds of
@@ -152,6 +151,7 @@ interface DuplicateGroupRowProps {
   onOpenViewer: (group: DuplicateGroup, index: number) => void
   onMouseEnterPhoto: (group: DuplicateGroup, index: number) => void
   onMouseLeavePhoto: () => void
+  onUnmount: (groupId: string) => void
 }
 
 const DuplicateGroupRow = memo(function DuplicateGroupRow({
@@ -165,7 +165,9 @@ const DuplicateGroupRow = memo(function DuplicateGroupRow({
   onOpenViewer,
   onMouseEnterPhoto,
   onMouseLeavePhoto,
+  onUnmount,
 }: DuplicateGroupRowProps) {
+  useEffect(() => () => onUnmount(group.id), [group.id, onUnmount])
   const allTrashed = isWholeGroupTrashed(keptSet)
   return (
     <Paper
@@ -385,26 +387,7 @@ export function DuplicateGroups({
     index: number
   } | null>(null)
 
-  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE)
-  const sentinelRef = useRef<HTMLDivElement>(null)
-
-  // Reset pagination when groups change (new scan)
-  useEffect(() => { setVisibleCount(PAGE_SIZE) }, [groups])
-
-  // Infinite scroll: observe sentinel once per groups identity.
-  // Functional setState needs no visibleCount in the closure.
-  useEffect(() => {
-    const el = sentinelRef.current
-    if (!el) return
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (entry.isIntersecting) setVisibleCount((c) => c + PAGE_SIZE)
-      },
-      { rootMargin: "400px" }
-    )
-    observer.observe(el)
-    return () => observer.disconnect()
-  }, [groups])
+  const groupIds = useMemo(() => groups.map((group) => group.id), [groups])
 
   const onOpenViewer = useCallback((group: DuplicateGroup, index: number) => {
     setViewerState({ group, index })
@@ -417,6 +400,17 @@ export function DuplicateGroups({
   const onMouseLeavePhoto = useCallback(() => {
     hoveredPhotoRef.current = null
   }, [])
+  const onGroupUnmount = useCallback((groupId: string) => {
+    if (hoveredPhotoRef.current?.group.id === groupId) hoveredPhotoRef.current = null
+  }, [])
+
+  const renderGroup = useCallback((index: number) => {
+    const group = groups[index]
+    return <DuplicateGroupRow key={group.id} group={group} mediaItems={mediaItems}
+      isSelected={selectedGroupIds.has(group.id)} keptSet={keptByGroupId.get(group.id)!}
+      onToggleGroup={onToggleGroup} onToggleKept={onToggleKept} onTrashWholeGroup={onTrashWholeGroup}
+      onOpenViewer={onOpenViewer} onMouseEnterPhoto={onMouseEnterPhoto} onMouseLeavePhoto={onMouseLeavePhoto} onUnmount={onGroupUnmount} />
+  }, [groups, mediaItems, selectedGroupIds, keptByGroupId, onToggleGroup, onToggleKept, onTrashWholeGroup, onOpenViewer, onMouseEnterPhoto, onMouseLeavePhoto, onGroupUnmount])
 
   // Spacebar key opens preview for the photo under the cursor
   useEffect(() => {
@@ -492,24 +486,9 @@ export function DuplicateGroups({
         </Alert>
       )}
 
-      {groups.slice(0, visibleCount).map((group) => (
-        <DuplicateGroupRow
-          key={group.id}
-          group={group}
-          mediaItems={mediaItems}
-          isSelected={selectedGroupIds.has(group.id)}
-          keptSet={keptByGroupId.get(group.id)!}
-          onToggleGroup={onToggleGroup}
-          onToggleKept={onToggleKept}
-          onTrashWholeGroup={onTrashWholeGroup}
-          onOpenViewer={onOpenViewer}
-          onMouseEnterPhoto={onMouseEnterPhoto}
-          onMouseLeavePhoto={onMouseLeavePhoto}
-        />
-      ))}
-
-      {/* Infinite scroll sentinel */}
-      {visibleCount < groups.length && <div ref={sentinelRef} />}
+      {groups.length > 60
+        ? <VirtualGroupList ids={groupIds} render={renderGroup} />
+        : groups.map((_, index) => renderGroup(index))}
 
       {/* Photo viewer modal — rendered once outside the map, state drives which photo */}
       {viewerState && (

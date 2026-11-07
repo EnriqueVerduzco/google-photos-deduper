@@ -1,4 +1,8 @@
 (() => {
+  var __defProp = Object.defineProperty;
+  var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+  var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
+
   // node_modules/@mediapipe/tasks-vision/vision_bundle.mjs
   var t = "undefined" != typeof self ? self : {};
   function e(e2, n2) {
@@ -4287,8 +4291,162 @@
     return groups;
   }
 
+  // lib/smart-matcher.ts
+  function smartMatches(a2, b2, threshold, normA, normB) {
+    const limit = normA + normB - 2 * threshold;
+    const guard = Math.max(
+      1e-7,
+      (normA + normB + Math.abs(2 * threshold)) * Number.EPSILON * a2.length * 32
+    );
+    if (Number.isFinite(limit) && Number.isFinite(guard)) {
+      let distance = 0;
+      for (let start = 0; start < a2.length; start += 16) {
+        for (let k2 = start; k2 < Math.min(start + 16, a2.length); k2++) {
+          const d2 = a2[k2] - b2[k2];
+          distance += d2 * d2;
+        }
+        if (distance > limit + guard) return false;
+      }
+    }
+    let dot = 0;
+    for (let k2 = 0; k2 < a2.length; k2++) dot += a2[k2] * b2[k2];
+    return dot >= threshold;
+  }
+  function detectSmartBucket(rows, threshold) {
+    const parent = rows.map((_2, i2) => i2);
+    const find = (index) => {
+      let root = index;
+      while (parent[root] !== root) root = parent[root];
+      while (parent[index] !== index) {
+        const next = parent[index];
+        parent[index] = root;
+        index = next;
+      }
+      return root;
+    };
+    const norms = rows.map((row) => {
+      let norm = 0;
+      for (let k2 = 0; k2 < row.length; k2++) norm += row[k2] * row[k2];
+      return norm;
+    });
+    for (let i2 = 0; i2 < rows.length; i2++)
+      for (let j2 = i2 + 1; j2 < rows.length; j2++)
+        if (find(i2) !== find(j2) && smartMatches(rows[i2], rows[j2], threshold, norms[i2], norms[j2]))
+          parent[find(i2)] = find(j2);
+    const components = /* @__PURE__ */ new Map();
+    for (let i2 = 0; i2 < rows.length; i2++) {
+      const root = find(i2);
+      if (!components.has(root)) components.set(root, []);
+      components.get(root).push(i2);
+    }
+    return [...components.values()].filter((group) => group.length >= 2);
+  }
+
+  // lib/smart-match-cache.ts
+  var DB_NAME = "gpd-smart-matches";
+  var STORE = "buckets";
+  var ALGORITHM_VERSION = 1;
+  var SmartMatchCache = class _SmartMatchCache {
+    constructor(db) {
+      __publicField(this, "db", db);
+    }
+    static async open() {
+      if (typeof indexedDB === "undefined" || !globalThis.crypto?.subtle)
+        return null;
+      return new Promise((resolve) => {
+        const request = indexedDB.open(DB_NAME, 1);
+        request.onupgradeneeded = () => request.result.createObjectStore(STORE).createIndex("createdAt", "createdAt");
+        request.onsuccess = () => resolve(new _SmartMatchCache(request.result));
+        request.onerror = () => resolve(null);
+      });
+    }
+    async fingerprint(keys, rows, threshold) {
+      const header = new TextEncoder().encode(
+        JSON.stringify([
+          ALGORITHM_VERSION,
+          String(threshold),
+          keys,
+          rows.map((row) => row.length)
+        ])
+      );
+      const bytes = new Uint8Array(
+        header.length + rows.reduce((n2, row) => n2 + row.byteLength, 0)
+      );
+      bytes.set(header);
+      let offset = header.length;
+      for (const row of rows) {
+        bytes.set(
+          new Uint8Array(row.buffer, row.byteOffset, row.byteLength),
+          offset
+        );
+        offset += row.byteLength;
+      }
+      const digest = await crypto.subtle.digest("SHA-256", bytes);
+      return Array.from(
+        new Uint8Array(digest),
+        (b2) => b2.toString(16).padStart(2, "0")
+      ).join("");
+    }
+    async get(key, count) {
+      return new Promise((resolve) => {
+        try {
+          const request = this.db.transaction(STORE).objectStore(STORE).get(key);
+          request.onsuccess = () => {
+            const record = request.result;
+            const groups = record?.groups;
+            const seen = /* @__PURE__ */ new Set();
+            if (record?.count !== count || !Array.isArray(groups) || !groups.every(
+              (group) => Array.isArray(group) && group.length >= 2 && group.every((index) => {
+                if (!Number.isInteger(index) || index < 0 || index >= count || seen.has(index))
+                  return false;
+                seen.add(index);
+                return true;
+              })
+            ))
+              resolve(null);
+            else resolve(groups);
+          };
+          request.onerror = () => resolve(null);
+        } catch {
+          resolve(null);
+        }
+      });
+    }
+    async put(key, count, groups) {
+      return new Promise((resolve) => {
+        try {
+          const tx = this.db.transaction(STORE, "readwrite");
+          const store = tx.objectStore(STORE);
+          store.put({ count, groups, createdAt: Date.now() }, key);
+          const countRequest = store.count();
+          countRequest.onsuccess = () => {
+            let remaining = countRequest.result - 2e3;
+            if (remaining <= 0) return;
+            const cursorRequest = store.index("createdAt").openKeyCursor();
+            cursorRequest.onsuccess = () => {
+              const cursor = cursorRequest.result;
+              if (cursor && remaining-- > 0) {
+                store.delete(cursor.primaryKey);
+                cursor.continue();
+              }
+            };
+          };
+          tx.oncomplete = tx.onabort = tx.onerror = () => resolve();
+        } catch {
+          resolve();
+        }
+      });
+    }
+    close() {
+      this.db.close();
+    }
+  };
+
   // workers/embedder.worker.ts
   var embedder = null;
+  var canvas = null;
+  var context = null;
+  var smartCachePromise;
   self.addEventListener("message", async (event) => {
     const { type, data } = event.data;
     if (type === "init") {
@@ -4314,21 +4472,26 @@
       const { items } = data;
       const results = [];
       for (const { localIdx, blob } of items) {
+        let bitmap;
         try {
-          const bitmap = await createImageBitmap(blob);
-          const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-          const ctx = canvas.getContext("2d");
-          ctx.drawImage(bitmap, 0, 0);
-          const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+          bitmap = await createImageBitmap(blob);
+          if (!canvas) {
+            canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+            context = canvas.getContext("2d");
+          }
+          if (canvas.width !== bitmap.width) canvas.width = bitmap.width;
+          if (canvas.height !== bitmap.height) canvas.height = bitmap.height;
+          context.clearRect(0, 0, canvas.width, canvas.height);
+          context.drawImage(bitmap, 0, 0);
+          const imageData = context.getImageData(0, 0, bitmap.width, bitmap.height);
           const result = embedder.embed(imageData);
           if (result?.embeddings?.[0]?.floatEmbedding) {
-            const buf = new Float32Array(
-              result.embeddings[0].floatEmbedding
-            ).buffer.slice(0);
+            const buf = new Float32Array(result.embeddings[0].floatEmbedding).buffer;
             results.push({ localIdx, embedding: buf });
           }
-          bitmap.close();
         } catch {
+        } finally {
+          bitmap?.close();
         }
       }
       const transferables = results.map((r2) => r2.embedding);
@@ -4348,38 +4511,40 @@
       self.postMessage({ type: "detectionResults", groups });
     }
     if (type === "detectSmart") {
-      const { flatEmbeddings, n: n2, dim, threshold, buckets } = data;
-      const embeddings = [];
-      for (let i2 = 0; i2 < n2; i2++)
-        embeddings.push(flatEmbeddings.subarray(i2 * dim, (i2 + 1) * dim));
-      const allGroups = [];
-      for (let bi2 = 0; bi2 < buckets.length; bi2++) {
-        const bucket = buckets[bi2];
-        const parent = bucket.map((_2, j2) => j2);
-        const find = (x2) => parent[x2] === x2 ? x2 : parent[x2] = find(parent[x2]);
-        const union = (a2, b2) => {
-          parent[find(a2)] = find(b2);
-        };
-        for (let i2 = 0; i2 < bucket.length; i2++) {
-          for (let j2 = i2 + 1; j2 < bucket.length; j2++) {
-            const a2 = embeddings[bucket[i2]];
-            const b2 = embeddings[bucket[j2]];
-            let dot = 0;
-            for (let k2 = 0; k2 < dim; k2++) dot += a2[k2] * b2[k2];
-            if (dot >= threshold) union(i2, j2);
+      try {
+        const { flatEmbeddings, n: n2, dim, threshold, buckets, mediaKeys } = data;
+        const rows = Array.from({ length: n2 }, (_2, i2) => flatEmbeddings.subarray(i2 * dim, (i2 + 1) * dim));
+        const allGroups = [];
+        let cacheHits = 0, lastProgress = 0;
+        const cache = mediaKeys ? await (smartCachePromise ?? (smartCachePromise = SmartMatchCache.open())) : null;
+        for (let bi2 = 0; bi2 < buckets.length; bi2++) {
+          const bucket = buckets[bi2];
+          const bucketRows = bucket.map((index) => rows[index]);
+          let key;
+          let groups = null;
+          if (cache && bucket.length >= 64 && mediaKeys) {
+            try {
+              key = await cache.fingerprint(bucket.map((index) => mediaKeys[index]), bucketRows, threshold);
+              groups = await cache.get(key, bucket.length);
+              if (groups) cacheHits++;
+            } catch {
+            }
+          }
+          if (!groups) {
+            groups = detectSmartBucket(bucketRows, threshold);
+            if (cache && key) await cache.put(key, bucket.length, groups);
+          }
+          for (const group of groups) allGroups.push(group.map((index) => bucket[index]));
+          const now = performance.now();
+          if (bi2 + 1 === buckets.length || now - lastProgress >= 100) {
+            self.postMessage({ type: "detectionProgress", current: bi2 + 1, total: buckets.length });
+            lastProgress = now;
           }
         }
-        const components = /* @__PURE__ */ new Map();
-        for (let i2 = 0; i2 < bucket.length; i2++) {
-          const root = find(i2);
-          if (!components.has(root)) components.set(root, []);
-          components.get(root).push(bucket[i2]);
-        }
-        for (const [, members] of components)
-          if (members.length >= 2) allGroups.push(members);
-        self.postMessage({ type: "detectionProgress", current: bi2 + 1, total: buckets.length });
+        self.postMessage({ type: "detectionResults", groups: allGroups, cacheHits });
+      } catch (error) {
+        self.postMessage({ type: "detectionError", message: String(error) });
       }
-      self.postMessage({ type: "detectionResults", groups: allGroups });
     }
   });
 })();

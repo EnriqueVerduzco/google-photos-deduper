@@ -256,7 +256,8 @@ export interface DuplicateGroup {
 
 export interface StoredState {
   scanResults?: {
-    mediaItems: Record<string, GpdMediaItem>;
+    mediaItems?: Record<string, GpdMediaItem>;
+    mediaSnapshotId?: string;
     groups: DuplicateGroup[];
     scanDate: number;
     totalItems: number;

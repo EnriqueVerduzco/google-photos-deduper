@@ -15,6 +15,7 @@ import type {
   GptkCommandMessage
 } from "../../lib/types"
 import App from "../../tabs/app"
+import * as savedResults from "../../lib/saved-results"
 
 const detection = vi.hoisted(() => ({ smart: vi.fn(), full: vi.fn() }))
 vi.mock("../../lib/duplicate-detector", () => ({
@@ -116,6 +117,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   vi.unstubAllGlobals()
+  vi.restoreAllMocks()
 })
 async function mount() {
   render(<App />)
@@ -331,4 +333,30 @@ it("shows the split-bucket notice even when no duplicates were found", async () 
   await deliver(end(command.requestId))
   await screen.findByText("No duplicates found in your library.")
   expect(screen.getByRole("alert")).toHaveTextContent("Duplicates spanning a split may be missed")
+})
+
+it("does not let delayed snapshot hydration replace a scan that has already started", async () => {
+  const saved = { mediaItems: { old: item("old") }, groups: [], totalItems: 1, scanDate: 1, accountEmail: account }
+  store.scanResults = saved
+  let finish!: (value: typeof saved) => void
+  vi.spyOn(savedResults, "hydrateSavedResults").mockImplementation(() => new Promise((resolve) => { finish = resolve }))
+  await mount()
+  const command = await start()
+  await act(async () => finish(saved))
+  expect(screen.getByText("fetching")).toBeInTheDocument()
+  await deliver(page(command.requestId, [item("current")]))
+  await deliver(end(command.requestId))
+  await waitFor(() => expect(detection.smart).toHaveBeenCalledOnce())
+  expect(detection.smart.mock.calls[0][0].map((row: GpdMediaItem) => row.mediaKey)).toEqual(["current"])
+})
+
+it("does not restore a delayed snapshot from a different known account", async () => {
+  const saved = { mediaItems: { old: item("old") }, groups: [], totalItems: 1, scanDate: 1, accountEmail: "other@example.com" }
+  store.scanResults = saved
+  let finish!: (value: typeof saved) => void
+  vi.spyOn(savedResults, "hydrateSavedResults").mockImplementation(() => new Promise((resolve) => { finish = resolve }))
+  await mount()
+  await act(async () => finish(saved))
+  expect(screen.getByRole("button", { name: "Start local test scan" })).toBeInTheDocument()
+  expect(screen.queryByText("Rescan")).not.toBeInTheDocument()
 })

@@ -27,6 +27,7 @@ export interface StableEstimate {
 }
 
 export interface PhaseTimings {
+  loadCachedEmbeddingsMs?: number
   fetchMediaItemsMs?: number
   fetchThumbnailsMs?: number
   computeEmbeddingsMs?: number

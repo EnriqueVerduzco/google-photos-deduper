@@ -38,6 +38,8 @@ import { APP_ID, DEFAULT_SETTINGS } from "../lib/types"
 import { mergeMediaItems, normalizeAccount, patchMediaIndex, saveMediaIndex } from "../lib/media-index"
 import { countFullyTrashedGroups, toggleWholeGroupTrashed } from "../lib/kept-overrides"
 import { MediaStream } from "../lib/media-stream"
+import { disposeEmbeddingWorkers } from "../lib/embedding-worker-pool"
+import { clearSavedResults, hydrateSavedResults, persistSavedResults } from "../lib/saved-results"
 import type { MediaFetchLog } from "../lib/scan-log"
 import type {
   AppMessage,
@@ -570,7 +572,11 @@ export default function App() {
   )
 
   // Stop the fetch watchdog if the app tab goes away mid-scan
-  useEffect(() => clearFetchWatchdog, [clearFetchWatchdog])
+  useEffect(() => () => {
+    clearFetchWatchdog()
+    scanAbortRef.current?.abort()
+    disposeEmbeddingWorkers()
+  }, [clearFetchWatchdog])
 
   // Health check on mount + recover any scan log entry orphaned by a page reload
   useEffect(() => {
@@ -580,35 +586,39 @@ export default function App() {
 
   // Load saved settings and results on mount
   useEffect(() => {
+    let active = true
     chrome.storage.local.get(
       ["settings", "scanResults", "selections"],
-      (result: Partial<StoredState>) => {
+      async (result: Partial<StoredState>) => {
+        if (!active) return
         if (result.settings) {
           setSettings(result.settings)
         }
-        if (result.selections) {
-          // Store deserialized selections before dispatching LOAD_SAVED_RESULTS so
-          // the groups-change effect can apply them when groups first appear
-          pendingSelectionsRef.current = {
-            selectedGroupIds: new Set(result.selections.selectedGroupIds),
-            keptOverrides: Object.fromEntries(
-              Object.entries(result.selections.keptOverrides).map(([k, v]) => [k, new Set(v)])
-            ),
-          }
-        }
         if (result.scanResults?.totalItems && Array.isArray(result.scanResults.groups)) {
-          dispatch({
-            type: "LOAD_SAVED_RESULTS",
-            mediaItems: result.scanResults.mediaItems,
-            groups: result.scanResults.groups,
-            totalItems: result.scanResults.totalItems,
-            bucketsSplit: result.scanResults.bucketsSplit,
-            accountEmail: result.scanResults.accountEmail
-          })
+          const saved = await hydrateSavedResults(result.scanResults).catch(() => null)
+          if (!active) return
+          const current = stateRef.current
+          const currentAccount = "accountEmail" in current ? normalizeAccount(current.accountEmail) : ""
+          const savedAccount = normalizeAccount(saved?.accountEmail)
+          const canRestore = currentScanRequestIdRef.current === null &&
+            ["connecting", "connected", "disconnected"].includes(current.status) &&
+            !(currentAccount && savedAccount && currentAccount !== savedAccount)
+          if (saved && canRestore) {
+            if (result.selections) pendingSelectionsRef.current = {
+              selectedGroupIds: new Set(result.selections.selectedGroupIds),
+              keptOverrides: Object.fromEntries(Object.entries(result.selections.keptOverrides).map(([key, values]) => [key, new Set(values)])),
+            }
+            dispatch({
+              type: "LOAD_SAVED_RESULTS", mediaItems: saved.mediaItems,
+              groups: saved.groups, totalItems: saved.totalItems,
+              bucketsSplit: saved.bucketsSplit, accountEmail: saved.accountEmail
+            })
+          }
         }
         setStorageChecked(true)
       }
     )
+    return () => { active = false }
   }, [])
 
   // Persist scan results when they change (after scan or trash)
@@ -673,19 +683,13 @@ export default function App() {
   useEffect(() => {
     if (!mediaItems) return
     if (groups.length > 0) {
-      chrome.storage.local.set({
-        scanResults: {
-          mediaItems,
-          groups,
-          scanDate: Date.now(),
-          totalItems,
-          bucketsSplit,
-          accountEmail: accountEmailForStorage
-        }
-      })
+      void persistSavedResults({
+        mediaItems, groups, scanDate: Date.now(), totalItems, bucketsSplit,
+        accountEmail: accountEmailForStorage,
+      }).catch((error) => console.warn("[GPD] Could not save scan results:", error))
     } else {
       // All duplicates removed — clear saved results so next open starts fresh
-      chrome.storage.local.remove("scanResults")
+      void clearSavedResults().catch((error) => console.warn("[GPD] Could not clear scan results:", error))
     }
   }, [groups, mediaItems, totalItems, bucketsSplit, accountEmailForStorage])
 

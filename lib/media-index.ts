@@ -1,4 +1,5 @@
 import type { GpdMediaItem, StoredState } from "./types"
+import { loadLibrarySnapshot, rememberSnapshotAccount, saveLibrarySnapshot } from "./library-snapshots"
 
 /** Metadata only. Independent of duplicate results and embedding/media caches. */
 export interface MediaIndex {
@@ -7,6 +8,7 @@ export interface MediaIndex {
   mediaItems: Record<string, GpdMediaItem>
   newestCreationTimestamp: number
   refreshedAt: number
+  snapshotId?: string
 }
 
 export function normalizeAccount(email?: string): string {
@@ -75,14 +77,32 @@ function enqueue(key: string, operation: () => Promise<void>): Promise<void> {
   return next
 }
 
-export async function saveMediaIndex(
-  email: string | undefined,
-  items: GpdMediaItem[]
-): Promise<void> {
+async function persistIndex(key: string, index: MediaIndex): Promise<void> {
+  const snapshotId = await saveLibrarySnapshot(index.accountEmail, Object.values(index.mediaItems))
+  if (snapshotId) {
+    const { mediaItems, ...summary } = index
+    await chrome.storage.local.set({ [key]: { ...summary, version: 2, snapshotId } })
+    await rememberSnapshotAccount(key)
+  } else await chrome.storage.local.set({ [key]: index })
+}
+
+export async function saveMediaIndex(email: string | undefined, items: GpdMediaItem[]): Promise<void> {
   const key = mediaIndexKey(email)
-  if (!key) return // Never share an unidentified account's metadata.
+  if (!key) return
   const index = createMediaIndex(email!, items)
-  await enqueue(key, () => chrome.storage.local.set({ [key]: index }))
+  await enqueue(key, () => persistIndex(key, index))
+}
+
+async function readIndex(key: string, email?: string): Promise<MediaIndex | null> {
+  const stored = await chrome.storage.local.get(key)
+  const index = stored[key]
+  if (normalizeAccount(index?.accountEmail) !== normalizeAccount(email)) return null
+  if (index?.version === 1 && index.mediaItems) return index as MediaIndex
+  if (index?.version === 2 && typeof index.snapshotId === "string") {
+    const mediaItems = await loadLibrarySnapshot(index.snapshotId, email)
+    if (mediaItems) return { ...index, version: 1, mediaItems }
+  }
+  return null
 }
 
 export async function loadMediaIndex(
@@ -91,31 +111,27 @@ export async function loadMediaIndex(
   const key = mediaIndexKey(email)
   if (!key) return null
   await writes.get(key)
-  const stored = await chrome.storage.local.get(key)
-  const index = stored[key] as MediaIndex | undefined
-  if (
-    index?.version === 1 &&
-    normalizeAccount(index.accountEmail) === normalizeAccount(email) &&
-    index.mediaItems
-  ) {
-    return index
-  }
+  const existing = await readIndex(key, email)
+  if (existing) return existing
   // Migrate lazily without removing/changing the existing scan results.
   const legacy = (
     (await chrome.storage.local.get("scanResults")) as Partial<StoredState>
   ).scanResults
   if (
-    !legacy?.mediaItems ||
+    !legacy ||
     !normalizeAccount(legacy.accountEmail) ||
     normalizeAccount(legacy.accountEmail) !== normalizeAccount(email)
   )
     return null
+  const legacyItems = legacy.mediaItems ?? (legacy.mediaSnapshotId
+    ? await loadLibrarySnapshot(legacy.mediaSnapshotId, email) : null)
+  if (!legacyItems) return null
   const migrated = createMediaIndex(
     email!,
-    Object.values(legacy.mediaItems),
+    Object.values(legacyItems),
     legacy.scanDate
   )
-  await enqueue(key, () => chrome.storage.local.set({ [key]: migrated }))
+  await enqueue(key, () => persistIndex(key, migrated))
   return migrated
 }
 
@@ -128,19 +144,12 @@ export async function patchMediaIndex(
   const key = mediaIndexKey(email)
   if (!key) return
   await enqueue(key, async () => {
-    const stored = await chrome.storage.local.get(key)
-    const index = stored[key] as MediaIndex | undefined
-    if (
-      !index ||
-      normalizeAccount(index.accountEmail) !== normalizeAccount(email)
-    )
-      return
+    const index = await readIndex(key, email)
+    if (!index) return
     const removed = new Set(removedKeys)
     const items = mergeMediaItems(restoredItems, index.mediaItems).filter(
       (item) => !removed.has(item.mediaKey)
     )
-    await chrome.storage.local.set({
-      [key]: createMediaIndex(email!, items, index.refreshedAt)
-    })
+    await persistIndex(key, createMediaIndex(email!, items, index.refreshedAt))
   })
 }

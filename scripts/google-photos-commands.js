@@ -45,7 +45,7 @@ const RESULT_CHUNK_SIZE = 10000
 
 // Leave a short gap between library pages to reduce bursts against Google's
 // private metadata API. Thumbnail download concurrency is independent of this.
-const LIBRARY_PAGE_DELAY_MS = 1000
+const MIN_LIBRARY_PAGE_DELAY_MS = 250
 
 // Sends an array result as a sequence of gptkResultChunk messages.
 // Always sends at least one chunk so an empty result still completes.
@@ -113,6 +113,8 @@ async function getAllMediaItems(requestId, args) {
     }
   }
   const startedAt = performance.now()
+  let pageDelayMs = 500
+  let healthyPages = 0
   const metrics = {
     pages: 0, itemsReceived: 0, itemsEmitted: 0,
     pageItems: [], pageRequestMs: [], requestMs: 0,
@@ -160,6 +162,7 @@ async function getAllMediaItems(requestId, args) {
     // lcxiM and must read every page: upload watermarks do not apply here.
     do {
       assertAccount()
+      let retried = false
       const pageStart = performance.now()
       let page
       try {
@@ -171,6 +174,7 @@ async function getAllMediaItems(requestId, args) {
             500,
             true,
             (attempt) => {
+              if (attempt > 1) retried = true
               resetTimeout()
               metrics.requestAttempts = (metrics.requestAttempts ?? 0) + 1
               metrics.retries = (metrics.retries ?? 0) + (attempt > 1 ? 1 : 0)
@@ -181,6 +185,9 @@ async function getAllMediaItems(requestId, args) {
             {
               signal,
               onRetry: ({ attempt, maxAttempts, delayMs, rateLimited }) => {
+                retried = true
+                healthyPages = 0
+                if (rateLimited) pageDelayMs = Math.min(5000, Math.max(1000, pageDelayMs * 2))
                 resetTimeout(PAGE_TIMEOUT_MS + delayMs)
                 const reason = rateLimited
                   ? "Google Photos may be limiting requests."
@@ -243,7 +250,11 @@ async function getAllMediaItems(requestId, args) {
       if (nextPageId && seenPageIds.has(nextPageId)) throw new Error("Library pagination repeated a page token")
       if (nextPageId) {
         seenPageIds.add(nextPageId)
-        await new Promise((resolve) => setTimeout(resolve, LIBRARY_PAGE_DELAY_MS))
+        if (!retried && ++healthyPages >= 4) {
+          pageDelayMs = Math.max(MIN_LIBRARY_PAGE_DELAY_MS, Math.round(pageDelayMs * 0.7))
+          healthyPages = 0
+        }
+        await new Promise((resolve) => setTimeout(resolve, pageDelayMs))
       }
     } while (nextPageId)
 
